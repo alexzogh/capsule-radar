@@ -40,6 +40,13 @@ jobs:
       - name: Build firmware (${{ matrix.env }})
         run: pio run -e ${{ matrix.env }}
 
+      - name: Verify sdkconfig IRAM flags (LCD-2.1 only)
+        if: matrix.env == 'esp32-s3-lcd-21'
+        run: |
+          SDK=.pio/build/esp32-s3-lcd-21/config/sdkconfig.h
+          echo "=== GDMA/LCD IRAM flags ==="
+          grep -E 'GDMA|LCD_RGB' "$SDK" || echo "(none found in sdkconfig.h)"
+
       - name: Merge into a single flashable binary
         run: |
           B=.pio/build/${{ matrix.env }}
