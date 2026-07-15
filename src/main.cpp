@@ -806,6 +806,20 @@ void setup() {
     loadSettings();
     route_cache_begin();   // clear stale route cache if the label format changed
 
+#if defined(BOARD_LCD21) && !defined(DIAG_NO_WIFI)
+    // ST7701 RGB + WiFi coexistence: bring the WiFi radio (and its one-time RF calibration,
+    // which briefly disables the cache/interrupts) up BEFORE the RGB panel's DMA starts.
+    // Calibrating while the LCD is quiet avoids the interrupt-watchdog reset (TG1WDT_SYS_RST)
+    // that hit when WiFi initialised with the panel already refreshing. WiFiManager's
+    // autoConnect() below then reuses the already-initialised radio. (This mirrors the
+    // ordering in Waveshare's own demo, which starts WiFi before the LCD.)
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();               // triggers esp_wifi_start -> PHY/RF calibration now
+    delay(150);
+    WiFi.disconnect(false);     // drop the stray attempt; radio stays initialised
+    Serial.println("[wifi] radio pre-initialised before RGB panel start");
+#endif
+
     // --- Display + LVGL (M0) ----------------------------------------------
     // CO5300 AMOLED over QSPI + LVGL draw buffers in PSRAM, then a hello screen.
     // The panel is powered from the always-on DC1 rail, so it lights without the
