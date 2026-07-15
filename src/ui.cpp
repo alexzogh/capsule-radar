@@ -458,19 +458,6 @@ void ui_show_view(int idx) {
 // ------------------------------------------------------------------- splash
 static void splash_fade_cb(void *obj, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0); }
 
-static void splash_dismiss_cb(lv_timer_t *t) {
-    lv_obj_t *cont = (lv_obj_t *)t->user_data;
-    lv_timer_del(t);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, cont);
-    lv_anim_set_exec_cb(&a, splash_fade_cb);
-    lv_anim_set_values(&a, 255, 0);
-    lv_anim_set_time(&a, 600);
-    lv_anim_set_ready_cb(&a, splash_del_free_cb);
-    lv_anim_start(&a);
-}
-
 // JPEG splash decode target (used by splash_jpg_out callback)
 #if defined(ESP_PLATFORM)
 static lv_color_t *s_splashBuf = nullptr;
@@ -496,6 +483,19 @@ static void splash_del_free_cb(lv_anim_t *a) {
 #if defined(ESP_PLATFORM)
     if (s_splashBuf) { heap_caps_free(s_splashBuf); s_splashBuf = nullptr; }
 #endif
+}
+
+static void splash_dismiss_cb(lv_timer_t *t) {
+    lv_obj_t *cont = (lv_obj_t *)t->user_data;
+    lv_timer_del(t);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, cont);
+    lv_anim_set_exec_cb(&a, splash_fade_cb);
+    lv_anim_set_values(&a, 255, 0);
+    lv_anim_set_time(&a, 600);
+    lv_anim_set_ready_cb(&a, splash_del_free_cb);
+    lv_anim_start(&a);
 }
 
 void ui_splash_show(void) {
