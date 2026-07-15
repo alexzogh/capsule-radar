@@ -241,8 +241,8 @@ static void grid_draw_cb(lv_event_t *e) {
     ll.color = s_cRing;
     ll.width = 2;
     ll.opa = 41;
-    lv_point_t h1 = { (lv_coord_t)(s_cx - 211), s_cy }, h2 = { (lv_coord_t)(s_cx + 211), s_cy };
-    lv_point_t v1 = { s_cx, (lv_coord_t)(s_cy - 211) }, v2 = { s_cx, (lv_coord_t)(s_cy + 211) };
+    lv_point_t h1 = { (lv_coord_t)(s_cx - RADAR_R_OUTER_PX), s_cy }, h2 = { (lv_coord_t)(s_cx + RADAR_R_OUTER_PX), s_cy };
+    lv_point_t v1 = { s_cx, (lv_coord_t)(s_cy - RADAR_R_OUTER_PX) }, v2 = { s_cx, (lv_coord_t)(s_cy + RADAR_R_OUTER_PX) };
     lv_draw_line(d, &ll, &h1, &h2);
     lv_draw_line(d, &ll, &v1, &v2);
 }
