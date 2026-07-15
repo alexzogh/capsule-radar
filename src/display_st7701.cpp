@@ -23,7 +23,9 @@
 #include "esp_lcd_panel_rgb.h"
 
 // --- RGB data bus + timings (Waveshare demo: Display_ST7701.h) ----------------
-#define RGB_PCLK_HZ   (16 * 1000 * 1000)
+#define RGB_PCLK_HZ   (12 * 1000 * 1000)   // 12 MHz (~44 Hz). Lower than the demo's 16 MHz so the
+                                            // direct-from-PSRAM DMA keeps up without a bounce buffer
+                                            // (no drift). Drop to 10 MHz if any drift remains.
 #define RGB_HSYNC     38
 #define RGB_VSYNC     39
 #define RGB_DE        40
@@ -171,12 +173,12 @@ static bool rgb_panel_begin() {
     cfg.data_width = 16;
     cfg.bits_per_pixel = 16;
     cfg.num_fbs = 2;                        // 2 framebuffers = double-buffered (tear-free page flip).
-    // Bounce buffer: smooths PSRAM read latency and kills the horizontal "drift"/jitter of a
-    // direct-from-PSRAM RGB panel. It caused the earlier cache-off panic because its refill
-    // ISR memcpy'd PSRAM from flash-resident code — but that ISR now lives in IRAM
-    // (CONFIG_LCD_RGB_ISR_IRAM_SAFE + CONFIG_GDMA_ISR_IRAM_SAFE, set via custom_sdkconfig), so
-    // it runs safely during WiFi/NVS flash windows. Safe + stable now.
-    cfg.bounce_buffer_size_px = 10 * SCREEN_W;
+    // NO bounce buffer — permanently. Its refill ISR memcpy's from the PSRAM framebuffer, and
+    // PSRAM is unreachable while the cache is disabled during a WiFi/NVS flash op, so the copy
+    // faults ("Cache disabled..." with A4=0x2580=9600=this buffer). Making the ISR IRAM-safe
+    // can't help — the DATA it reads lives in PSRAM. Drift is instead controlled by a modest
+    // pixel clock (RGB_PCLK_HZ) so direct-from-PSRAM DMA comfortably keeps up, plus the
+    // per-VSYNC transmission restart (CONFIG_LCD_RGB_RESTART_IN_VSYNC) which resyncs each frame.
     cfg.hsync_gpio_num = RGB_HSYNC;
     cfg.vsync_gpio_num = RGB_VSYNC;
     cfg.de_gpio_num    = RGB_DE;
