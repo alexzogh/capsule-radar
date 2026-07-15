@@ -6,6 +6,7 @@
 #include <lvgl.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/time.h>
 
 // ---- colors (match radar_view / ui.cpp palette) ----
 #define CK_GREEN  lv_color_hex(0x1DFF86)
@@ -31,8 +32,9 @@ static float s_nearAlt  = 0.0f;
 
 // ---- timer callback: refresh time + aircraft info every second ----
 static void clock_tick_cb(lv_timer_t *) {
+    time_t now = time(nullptr);
     struct tm ti;
-    if (getLocalTime(&ti, 0)) {
+    if (now > 1000000000L && localtime_r(&now, &ti)) {
         char hm[8];
         snprintf(hm, sizeof(hm), "%02d:%02d", ti.tm_hour, ti.tm_min);
         lv_label_set_text(s_lblTime, hm);
