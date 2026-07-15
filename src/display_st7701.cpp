@@ -55,6 +55,7 @@ static volatile uint32_t s_frameCount = 0;
 uint32_t display_frames() { return s_frameCount; }
 
 static volatile uint8_t s_rot = 0;              // 0/1/2/3 = 0/90/180/270
+static bool s_ready = false;                    // LVGL up? (guards loop/rotation even if the panel failed)
 
 // --- ST7701 3-wire SPI init (bit-banged DC via cmd/addr; CS on TCA9554 EXIO3) --
 static void st7701_cmd(uint8_t cmd) {
@@ -169,7 +170,7 @@ static bool rgb_panel_begin() {
     cfg.timings.flags.pclk_active_neg = false;
     cfg.data_width = 16;
     cfg.bits_per_pixel = 16;
-    cfg.num_fbs = 2;
+    cfg.num_fbs = 2;                        // 2 framebuffers = double-buffered.
     cfg.bounce_buffer_size_px = 10 * SCREEN_W;
     cfg.hsync_gpio_num = RGB_HSYNC;
     cfg.vsync_gpio_num = RGB_VSYNC;
@@ -178,7 +179,8 @@ static bool rgb_panel_begin() {
     cfg.disp_gpio_num  = -1;
     for (int i = 0; i < 16; ++i) cfg.data_gpio_nums[i] = RGB_DATA_PINS[i];
     cfg.flags.fb_in_psram = true;
-    cfg.flags.double_fb   = true;
+    // NB: do NOT also set flags.double_fb here — with num_fbs already 2, newer ESP-IDF
+    // rejects the combination (ESP_ERR_INVALID_ARG), which left s_panel null -> crash loop.
 
     // Don't ESP_ERROR_CHECK (that abort()s -> silent reboot loop). Log and report instead.
     esp_err_t err;
@@ -218,8 +220,8 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) 
         }
         out = s_rotBuf;
     }
-    // Whole-screen blit; double_fb makes this a clean page flip (no tearing).
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, SCREEN_W, SCREEN_H, out);
+    // Whole-screen blit; the second framebuffer makes this a clean page flip (no tearing).
+    if (s_panel) esp_lcd_panel_draw_bitmap(s_panel, 0, 0, SCREEN_W, SCREEN_H, out);
     s_frameCount++;
     lv_disp_flush_ready(drv);
 }
@@ -266,11 +268,12 @@ bool begin() {
     delay(50);
 
     st7701_begin();       // push the ST7701 register init over 3-wire SPI
-    if (!rgb_panel_begin()) {   // start the RGB parallel refresh + framebuffers
-        Serial.println("[display] RGB panel bring-up FAILED (see error above)");
-        return false;
-    }
-    Serial.println("[display] panel up; init LVGL...");
+    // If the RGB panel fails, keep going with a null panel: flush becomes a no-op, but LVGL,
+    // touch, WiFi, the web server and (critically) USB-CDC serial all still come up so the
+    // failure is diagnosable instead of a silent reboot loop.
+    const bool panelOk = rgb_panel_begin();
+    if (!panelOk) Serial.println("[display] RGB panel bring-up FAILED — continuing headless for diagnostics");
+    else          Serial.println("[display] panel up; init LVGL...");
 
     lv_init();
 
@@ -285,6 +288,7 @@ bool begin() {
         return false;
     }
     lv_disp_draw_buf_init(&s_draw_buf, s_buf1, s_buf2, px);
+    Serial.printf("[display] LVGL draw buffers OK (%u KB free PSRAM)\n", (unsigned)(ESP.getFreePsram() / 1024));
 
     lv_disp_drv_init(&s_disp_drv);
     s_disp_drv.hor_res      = SCREEN_W;
@@ -302,13 +306,13 @@ bool begin() {
         Serial.println("[display] CST820 touch registered");
     }
 
-    Serial.printf("[display] PSRAM free: %u KB\n", (unsigned)(ESP.getFreePsram() / 1024));
     ui_create();
-    Serial.println("[display] LVGL ready");
-    return true;
+    s_ready = true;
+    Serial.printf("[display] LVGL ready (panel %s)\n", panelOk ? "OK" : "FAILED — screen will stay blank");
+    return panelOk;
 }
 
-void loop() { lv_timer_handler(); }
+void loop() { if (s_ready) lv_timer_handler(); }
 
 // 0..255 -> PWM duty. Backlight is active-high on this board.
 void setBrightness(uint8_t v) {
@@ -318,12 +322,13 @@ void setBrightness(uint8_t v) {
 
 void setRotation(uint8_t quarters) {
     s_rot = (uint8_t)(quarters & 3);
+    if (!s_ready) return;
     lv_obj_t *scr = lv_scr_act();
     if (scr) lv_obj_invalidate(scr);
 }
 uint8_t rotation() { return s_rot; }
 
-uint32_t inactiveMs() { return lv_disp_get_inactive_time(NULL); }
+uint32_t inactiveMs() { return s_ready ? lv_disp_get_inactive_time(NULL) : 0; }
 
 } // namespace display
 
