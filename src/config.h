@@ -50,8 +50,7 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define ADSB_MAX_AIRCRAFT   60              // hard cap parsed per poll (protect RAM in busy areas)
 
 // ---------- Debug ----------
-#define DEBUG_MEM           1               // 1 = print a [mem] heap/fps line every 5s on serial
-                                            //   (temporarily on for LCD-2.1 crash diagnosis)
+#define DEBUG_MEM           0               // 1 = print a [mem] heap/fps line every 5s on serial
 
 // ---------- Common display / UX ----------
 #define LV_COLOR_DEPTH_BITS 16

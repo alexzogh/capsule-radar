@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(ESP_PLATFORM)
+#include <TJpg_Decoder.h>
+#include <esp_heap_caps.h>
+#include "splash_jpg.h"
+#endif
 
 #define UI_GREEN lv_color_hex(0x1DFF86)
 #define UI_INK   lv_color_hex(0xEAFFF3)
@@ -452,7 +457,6 @@ void ui_show_view(int idx) {
 
 // ------------------------------------------------------------------- splash
 static void splash_fade_cb(void *obj, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0); }
-static void splash_del_cb(lv_anim_t *a) { lv_obj_del((lv_obj_t *)a->var); }
 
 static void splash_dismiss_cb(lv_timer_t *t) {
     lv_obj_t *cont = (lv_obj_t *)t->user_data;
@@ -463,8 +467,35 @@ static void splash_dismiss_cb(lv_timer_t *t) {
     lv_anim_set_exec_cb(&a, splash_fade_cb);
     lv_anim_set_values(&a, 255, 0);
     lv_anim_set_time(&a, 600);
-    lv_anim_set_ready_cb(&a, splash_del_cb);
+    lv_anim_set_ready_cb(&a, splash_del_free_cb);
     lv_anim_start(&a);
+}
+
+// JPEG splash decode target (used by splash_jpg_out callback)
+#if defined(ESP_PLATFORM)
+static lv_color_t *s_splashBuf = nullptr;
+static int s_splashW = 0, s_splashH = 0;
+static lv_img_dsc_t s_splashDsc;
+
+static bool splash_jpg_out(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bmp) {
+    for (int j = 0; j < (int)h; ++j) {
+        const int yy = y + j;
+        if (yy < 0 || yy >= s_splashH) continue;
+        for (int i = 0; i < (int)w; ++i) {
+            const int xx = x + i;
+            if (xx < 0 || xx >= s_splashW) continue;
+            s_splashBuf[yy * s_splashW + xx].full = bmp[j * w + i];
+        }
+    }
+    return true;
+}
+#endif
+
+static void splash_del_free_cb(lv_anim_t *a) {
+    lv_obj_del((lv_obj_t *)a->var);
+#if defined(ESP_PLATFORM)
+    if (s_splashBuf) { heap_caps_free(s_splashBuf); s_splashBuf = nullptr; }
+#endif
 }
 
 void ui_splash_show(void) {
@@ -476,41 +507,70 @@ void ui_splash_show(void) {
     lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
     lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
 
-    // concentric rings
-    const lv_coord_t dia[3] = { 210, 142, 78 };
-    const lv_opa_t   op[3]  = { 90, 120, 160 };
-    for (int i = 0; i < 3; ++i) {
-        lv_obj_t *r = lv_obj_create(cont);
-        lv_obj_remove_style_all(r);
-        lv_obj_set_size(r, dia[i], dia[i]);
-        lv_obj_align(r, LV_ALIGN_CENTER, 0, -8);
-        lv_obj_set_style_radius(r, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_border_color(r, UI_GREEN, 0);
-        lv_obj_set_style_border_opa(r, op[i], 0);
-        lv_obj_set_style_border_width(r, 2, 0);
-        lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+#if defined(ESP_PLATFORM)
+    // Decode the embedded JPEG splash into a PSRAM buffer and show it as an LVGL image.
+    s_splashW = SCREEN_W;
+    s_splashH = SCREEN_H;
+    const size_t bufSz = (size_t)s_splashW * s_splashH * sizeof(lv_color_t);
+    s_splashBuf = (lv_color_t *)heap_caps_malloc(bufSz, MALLOC_CAP_SPIRAM);
+    bool imgOk = false;
+    if (s_splashBuf) {
+        memset(s_splashBuf, 0, bufSz);
+        TJpgDec.setJpgScale(1);
+        TJpgDec.setSwapBytes(false);
+        TJpgDec.setCallback(splash_jpg_out);
+        imgOk = (TJpgDec.drawJpg(0, 0, splash_jpg_data, splash_jpg_len) == JDR_OK);
     }
-    // rotating sweep
-    lv_obj_t *sweep = lv_spinner_create(cont, 1400, 55);
-    lv_obj_set_size(sweep, 210, 210);
-    lv_obj_align(sweep, LV_ALIGN_CENTER, 0, -8);
-    lv_obj_set_style_arc_opa(sweep, 0, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(sweep, UI_GREEN, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(sweep, 4, LV_PART_INDICATOR);
+    if (imgOk) {
+        s_splashDsc.header.always_zero = 0;
+        s_splashDsc.header.w = s_splashW;
+        s_splashDsc.header.h = s_splashH;
+        s_splashDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+        s_splashDsc.data_size = bufSz;
+        s_splashDsc.data = (const uint8_t *)s_splashBuf;
+        lv_obj_t *img = lv_img_create(cont);
+        lv_img_set_src(img, &s_splashDsc);
+        lv_obj_center(img);
+    } else {
+        if (s_splashBuf) { heap_caps_free(s_splashBuf); s_splashBuf = nullptr; }
+#endif
+        // Fallback: procedural splash (simulator or decode failure)
+        const lv_coord_t dia[3] = { 210, 142, 78 };
+        const lv_opa_t   op[3]  = { 90, 120, 160 };
+        for (int i = 0; i < 3; ++i) {
+            lv_obj_t *r = lv_obj_create(cont);
+            lv_obj_remove_style_all(r);
+            lv_obj_set_size(r, dia[i], dia[i]);
+            lv_obj_align(r, LV_ALIGN_CENTER, 0, -8);
+            lv_obj_set_style_radius(r, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_border_color(r, UI_GREEN, 0);
+            lv_obj_set_style_border_opa(r, op[i], 0);
+            lv_obj_set_style_border_width(r, 2, 0);
+            lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        lv_obj_t *sweep = lv_spinner_create(cont, 1400, 55);
+        lv_obj_set_size(sweep, 210, 210);
+        lv_obj_align(sweep, LV_ALIGN_CENTER, 0, -8);
+        lv_obj_set_style_arc_opa(sweep, 0, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(sweep, UI_GREEN, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_width(sweep, 4, LV_PART_INDICATOR);
 
-    lv_obj_t *title = lv_label_create(cont);
-    lv_label_set_text(title, "CAPSULE RADAR");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(title, UI_GREEN, 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, 118);
+        lv_obj_t *title = lv_label_create(cont);
+        lv_label_set_text(title, "CAPSULE RADAR");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(title, UI_GREEN, 0);
+        lv_obj_align(title, LV_ALIGN_CENTER, 0, 118);
 
-    lv_obj_t *sub = lv_label_create(cont);
-    lv_label_set_text(sub, "Live ADS-B radar");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sub, UI_SOFT, 0);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 150);
+        lv_obj_t *sub = lv_label_create(cont);
+        lv_label_set_text(sub, "Live ADS-B radar");
+        lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(sub, UI_SOFT, 0);
+        lv_obj_align(sub, LV_ALIGN_CENTER, 0, 150);
+#if defined(ESP_PLATFORM)
+    }
+#endif
 
-    lv_timer_t *t = lv_timer_create(splash_dismiss_cb, 2200, cont);   // hold, then fade out
+    lv_timer_t *t = lv_timer_create(splash_dismiss_cb, 2200, cont);
     lv_timer_set_repeat_count(t, 1);
 }
 
