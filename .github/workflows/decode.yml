@@ -1,0 +1,31 @@
+name: Decode backtrace
+
+# Manual helper: build the LCD-2.1 firmware and run addr2line on a panic backtrace.
+#   gh workflow run decode.yml --ref <branch> -f addrs="0x... 0x... ..."
+
+on:
+  workflow_dispatch:
+    inputs:
+      addrs:
+        description: 'Space-separated backtrace / PC addresses'
+        required: true
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build LCD-2.1 firmware (for the .elf)
+        run: pio run -e esp32-s3-lcd-21
+      - name: addr2line
+        run: |
+          ELF=.pio/build/esp32-s3-lcd-21/firmware.elf
+          A2L="$(find "$HOME/.platformio/packages" -name 'xtensa-esp32s3-elf-addr2line' | head -1)"
+          echo "elf=$ELF"; echo "addr2line=$A2L"
+          echo "=== DECODED ==="
+          "$A2L" -pfiaC -e "$ELF" ${{ github.event.inputs.addrs }}
