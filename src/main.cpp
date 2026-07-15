@@ -860,6 +860,7 @@ void setup() {
     // --- WiFi (captive portal, non-blocking) ------------------------------
     // First boot opens the "CapsuleRadar-Setup" AP to enter WiFi creds. Non-blocking
     // so the radar keeps animating while you configure WiFi from your phone.
+#if !defined(DIAG_NO_WIFI)
     g_wm.setConfigPortalBlocking(false);
     g_wm.setTitle("Capsule Radar");
     // light phosphor-green theme for the captive portal (small CSS, injected into <head>)
@@ -884,6 +885,11 @@ void setup() {
         Serial.println("[wifi] connected");
     else
         Serial.println("[wifi] config portal open - join 'CapsuleRadar-Setup' to set WiFi; UI stays live");
+#else
+    // DIAG_NO_WIFI: skip all WiFi so the RGB panel runs with the radio off. Used to confirm
+    // the display is stable on its own and isolate the RGB-LCD + WiFi interrupt-watchdog reset.
+    Serial.println("[DIAG] WiFi disabled (DIAG_NO_WIFI) — display-only bring-up test");
+#endif
 
     // --- OTA ---------------------------------------------------------------
     // ArduinoOTA is started from loop() once WiFi connects (see otaUp there).
