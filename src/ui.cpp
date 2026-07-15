@@ -594,6 +594,7 @@ void ui_create(void) {
 
     // --- radar tile ---
     lv_obj_clear_flag(s_tileRadar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(s_tileRadar, 0, 0);
     radar::init(s_tileRadar);
     radar::setRangeLabelVisible(false);                     // the zoom button shows the range instead
     lv_obj_add_flag(s_tileRadar, LV_OBJ_FLAG_CLICKABLE);     // receive taps (planes/empty)
