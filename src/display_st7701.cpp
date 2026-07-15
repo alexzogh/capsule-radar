@@ -154,7 +154,7 @@ static void st7701_begin() {
     delay(10);
 }
 
-static void rgb_panel_begin() {
+static bool rgb_panel_begin() {
     esp_lcd_rgb_panel_config_t cfg = {};
     cfg.clk_src = LCD_CLK_SRC_DEFAULT;
     cfg.timings.pclk_hz = RGB_PCLK_HZ;
@@ -180,9 +180,19 @@ static void rgb_panel_begin() {
     cfg.flags.fb_in_psram = true;
     cfg.flags.double_fb   = true;
 
-    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &s_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+    // Don't ESP_ERROR_CHECK (that abort()s -> silent reboot loop). Log and report instead.
+    esp_err_t err;
+    if ((err = esp_lcd_new_rgb_panel(&cfg, &s_panel)) != ESP_OK) {
+        Serial.printf("[display] esp_lcd_new_rgb_panel: %s\n", esp_err_to_name(err)); return false;
+    }
+    if ((err = esp_lcd_panel_reset(s_panel)) != ESP_OK) {
+        Serial.printf("[display] rgb panel reset: %s\n", esp_err_to_name(err)); return false;
+    }
+    if ((err = esp_lcd_panel_init(s_panel)) != ESP_OK) {
+        Serial.printf("[display] rgb panel init: %s\n", esp_err_to_name(err)); return false;
+    }
+    Serial.println("[display] RGB panel initialised");
+    return true;
 }
 
 // --- LVGL flush: full frame each time (full_refresh=1), rotated into the panel FB -----
@@ -241,6 +251,10 @@ bool begin() {
 
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);   // shared bus: expander + touch + IMU + RTC
     tca9554_init();
+    // EXIO8 low at init (matches the Waveshare demo). tca9554_init() drives every expander
+    // pin as an output, and they power on high; EXIO8 high leaves the board's onboard
+    // buzzer/aux line asserted (constant tone), so pull it low immediately.
+    tca9554_set(8, 0);
 
     // Backlight PWM (start dim; main.cpp applies the saved brightness right after).
     ledcAttach(PIN_LCD_BL, LCD_BL_PWM_FREQ, LCD_BL_PWM_BITS);
@@ -252,7 +266,10 @@ bool begin() {
     delay(50);
 
     st7701_begin();       // push the ST7701 register init over 3-wire SPI
-    rgb_panel_begin();     // start the RGB parallel refresh + framebuffers
+    if (!rgb_panel_begin()) {   // start the RGB parallel refresh + framebuffers
+        Serial.println("[display] RGB panel bring-up FAILED (see error above)");
+        return false;
+    }
     Serial.println("[display] panel up; init LVGL...");
 
     lv_init();
