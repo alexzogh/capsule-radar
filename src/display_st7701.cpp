@@ -1,0 +1,313 @@
+// BOARD_LCD21 display bring-up: ST7701 480x480 IPS over the ESP32-S3 RGB parallel
+// peripheral (esp_lcd_panel_rgb) + LVGL v8. Implements the same display:: API as the
+// AMOLED build (display.cpp), so main.cpp / ui / radar_view are board-agnostic.
+//
+// The RGB pin map, timings, and the ST7701 init sequence are lifted verbatim from
+// Waveshare's own Arduino demo for this board (LVGL_Arduino / Display_ST7701). The
+// panel's chip-select + reset and the touch reset are on a TCA9554 I2C expander.
+#include "config.h"
+#if defined(BOARD_LCD21)
+
+#include "display.h"
+#include "radar_view.h"
+#include "ui.h"
+#include "touch_cst820.h"
+#include "tca9554.h"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <lvgl.h>
+#include <esp_heap_caps.h>
+#include "driver/spi_master.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_rgb.h"
+
+// --- RGB data bus + timings (Waveshare demo: Display_ST7701.h) ----------------
+#define RGB_PCLK_HZ   (16 * 1000 * 1000)
+#define RGB_HSYNC     38
+#define RGB_VSYNC     39
+#define RGB_DE        40
+#define RGB_PCLK      41
+static const int RGB_DATA_PINS[16] = {
+    5, 45, 48, 47, 21,          // B0..B4 (DATA0..4)
+    14, 13, 12, 11, 10, 9,      // G0..G5 (DATA5..10)
+    46, 3, 8, 18, 17            // R0..R4 (DATA11..15)
+};
+#define RGB_HPW 8
+#define RGB_HBP 10
+#define RGB_HFP 50
+#define RGB_VPW 3
+#define RGB_VBP 8
+#define RGB_VFP 8
+
+// --- state -------------------------------------------------------------------
+static esp_lcd_panel_handle_t s_panel = nullptr;
+static spi_device_handle_t    s_spi   = nullptr;
+
+static lv_disp_draw_buf_t s_draw_buf;
+static lv_disp_drv_t      s_disp_drv;
+static lv_indev_drv_t     s_indev_drv;
+static lv_color_t        *s_buf1   = nullptr;   // full-screen LVGL buffers (PSRAM)
+static lv_color_t        *s_buf2   = nullptr;
+static lv_color_t        *s_rotBuf = nullptr;   // full-screen scratch for 90/180/270 (PSRAM)
+
+static volatile uint32_t s_frameCount = 0;
+uint32_t display_frames() { return s_frameCount; }
+
+static volatile uint8_t s_rot = 0;              // 0/1/2/3 = 0/90/180/270
+
+// --- ST7701 3-wire SPI init (bit-banged DC via cmd/addr; CS on TCA9554 EXIO3) --
+static void st7701_cmd(uint8_t cmd) {
+    spi_transaction_t t = {};
+    t.cmd = 0;          // DC = 0 -> command
+    t.addr = cmd;
+    spi_device_transmit(s_spi, &t);
+}
+static void st7701_dat(uint8_t data) {
+    spi_transaction_t t = {};
+    t.cmd = 1;          // DC = 1 -> data
+    t.addr = data;
+    spi_device_transmit(s_spi, &t);
+}
+
+static void st7701_init_sequence() {
+    // Vendor init table (Waveshare Display_ST7701.cpp), unchanged.
+    st7701_cmd(0xFF); st7701_dat(0x77); st7701_dat(0x01); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x10);
+    st7701_cmd(0xC0); st7701_dat(0x3B); st7701_dat(0x00);
+    st7701_cmd(0xC1); st7701_dat(0x0B); st7701_dat(0x02);
+    st7701_cmd(0xC2); st7701_dat(0x07); st7701_dat(0x02);
+    st7701_cmd(0xCC); st7701_dat(0x10);
+    st7701_cmd(0xCD); st7701_dat(0x08);
+    st7701_cmd(0xB0); st7701_dat(0x00); st7701_dat(0x11); st7701_dat(0x16); st7701_dat(0x0e); st7701_dat(0x11);
+                      st7701_dat(0x06); st7701_dat(0x05); st7701_dat(0x09); st7701_dat(0x08); st7701_dat(0x21);
+                      st7701_dat(0x06); st7701_dat(0x13); st7701_dat(0x10); st7701_dat(0x29); st7701_dat(0x31); st7701_dat(0x18);
+    st7701_cmd(0xB1); st7701_dat(0x00); st7701_dat(0x11); st7701_dat(0x16); st7701_dat(0x0e); st7701_dat(0x11);
+                      st7701_dat(0x07); st7701_dat(0x05); st7701_dat(0x09); st7701_dat(0x09); st7701_dat(0x21);
+                      st7701_dat(0x05); st7701_dat(0x13); st7701_dat(0x11); st7701_dat(0x2a); st7701_dat(0x31); st7701_dat(0x18);
+    st7701_cmd(0xFF); st7701_dat(0x77); st7701_dat(0x01); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x11);
+    st7701_cmd(0xB0); st7701_dat(0x6d);
+    st7701_cmd(0xB1); st7701_dat(0x37);
+    st7701_cmd(0xB2); st7701_dat(0x81);
+    st7701_cmd(0xB3); st7701_dat(0x80);
+    st7701_cmd(0xB5); st7701_dat(0x43);
+    st7701_cmd(0xB7); st7701_dat(0x85);
+    st7701_cmd(0xB8); st7701_dat(0x20);
+    st7701_cmd(0xC1); st7701_dat(0x78);
+    st7701_cmd(0xC2); st7701_dat(0x78);
+    st7701_cmd(0xD0); st7701_dat(0x88);
+    st7701_cmd(0xE0); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x02);
+    st7701_cmd(0xE1); st7701_dat(0x03); st7701_dat(0xA0); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x04);
+                      st7701_dat(0xA0); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x20); st7701_dat(0x20);
+    st7701_cmd(0xE2); for (int i = 0; i < 13; ++i) st7701_dat(0x00);
+    st7701_cmd(0xE3); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x11); st7701_dat(0x00);
+    st7701_cmd(0xE4); st7701_dat(0x22); st7701_dat(0x00);
+    st7701_cmd(0xE5); st7701_dat(0x05); st7701_dat(0xEC); st7701_dat(0xA0); st7701_dat(0xA0); st7701_dat(0x07);
+                      st7701_dat(0xEE); st7701_dat(0xA0); st7701_dat(0xA0); st7701_dat(0x00); st7701_dat(0x00);
+                      st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00);
+    st7701_cmd(0xE6); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x11); st7701_dat(0x00);
+    st7701_cmd(0xE7); st7701_dat(0x22); st7701_dat(0x00);
+    st7701_cmd(0xE8); st7701_dat(0x06); st7701_dat(0xED); st7701_dat(0xA0); st7701_dat(0xA0); st7701_dat(0x08);
+                      st7701_dat(0xEF); st7701_dat(0xA0); st7701_dat(0xA0); st7701_dat(0x00); st7701_dat(0x00);
+                      st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00);
+    st7701_cmd(0xEB); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x40); st7701_dat(0x40); st7701_dat(0x00);
+                      st7701_dat(0x00); st7701_dat(0x00);
+    st7701_cmd(0xED); st7701_dat(0xFF); st7701_dat(0xFF); st7701_dat(0xFF); st7701_dat(0xBA); st7701_dat(0x0A);
+                      st7701_dat(0xBF); st7701_dat(0x45); st7701_dat(0xFF); st7701_dat(0xFF); st7701_dat(0x54);
+                      st7701_dat(0xFB); st7701_dat(0xA0); st7701_dat(0xAB); st7701_dat(0xFF); st7701_dat(0xFF); st7701_dat(0xFF);
+    st7701_cmd(0xEF); st7701_dat(0x10); st7701_dat(0x0D); st7701_dat(0x04); st7701_dat(0x08); st7701_dat(0x3F); st7701_dat(0x1F);
+    st7701_cmd(0xFF); st7701_dat(0x77); st7701_dat(0x01); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x13);
+    st7701_cmd(0xEF); st7701_dat(0x08);
+    st7701_cmd(0xFF); st7701_dat(0x77); st7701_dat(0x01); st7701_dat(0x00); st7701_dat(0x00); st7701_dat(0x00);
+    st7701_cmd(0x36); st7701_dat(0x00);
+    st7701_cmd(0x3A); st7701_dat(0x66);
+    st7701_cmd(0x11);                          // sleep out
+    delay(480);
+    st7701_cmd(0x20);                          // display inversion off
+    delay(120);
+    st7701_cmd(0x29);                          // display on
+}
+
+// Push the ST7701 init over 3-wire SPI (cmd=1 DC-bit, addr=8 payload bits), CS via EXIO3.
+static void st7701_begin() {
+    spi_bus_config_t buscfg = {};
+    buscfg.mosi_io_num = PIN_LCD_MOSI;
+    buscfg.miso_io_num = -1;
+    buscfg.sclk_io_num = PIN_LCD_SCLK;
+    buscfg.quadwp_io_num = -1;
+    buscfg.quadhd_io_num = -1;
+    buscfg.max_transfer_sz = 64;
+    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+    spi_device_interface_config_t devcfg = {};
+    devcfg.command_bits = 1;                   // DC bit
+    devcfg.address_bits = 8;                   // payload
+    devcfg.mode = 0;
+    devcfg.clock_speed_hz = 40 * 1000 * 1000;
+    devcfg.spics_io_num = -1;                  // CS is toggled via the TCA9554 expander
+    devcfg.queue_size = 1;
+    spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi);
+
+    tca9554_set(EXIO_LCD_CS, 0);               // assert CS low for the whole init
+    delay(10);
+    st7701_init_sequence();
+    tca9554_set(EXIO_LCD_CS, 1);               // release CS (RGB refresh is DE-driven, no CS)
+    delay(10);
+}
+
+static void rgb_panel_begin() {
+    esp_lcd_rgb_panel_config_t cfg = {};
+    cfg.clk_src = LCD_CLK_SRC_DEFAULT;
+    cfg.timings.pclk_hz = RGB_PCLK_HZ;
+    cfg.timings.h_res = SCREEN_W;
+    cfg.timings.v_res = SCREEN_H;
+    cfg.timings.hsync_pulse_width = RGB_HPW;
+    cfg.timings.hsync_back_porch  = RGB_HBP;
+    cfg.timings.hsync_front_porch = RGB_HFP;
+    cfg.timings.vsync_pulse_width = RGB_VPW;
+    cfg.timings.vsync_back_porch  = RGB_VBP;
+    cfg.timings.vsync_front_porch = RGB_VFP;
+    cfg.timings.flags.pclk_active_neg = false;
+    cfg.data_width = 16;
+    cfg.bits_per_pixel = 16;
+    cfg.num_fbs = 2;
+    cfg.bounce_buffer_size_px = 10 * SCREEN_W;
+    cfg.hsync_gpio_num = RGB_HSYNC;
+    cfg.vsync_gpio_num = RGB_VSYNC;
+    cfg.de_gpio_num    = RGB_DE;
+    cfg.pclk_gpio_num  = RGB_PCLK;
+    cfg.disp_gpio_num  = -1;
+    for (int i = 0; i < 16; ++i) cfg.data_gpio_nums[i] = RGB_DATA_PINS[i];
+    cfg.flags.fb_in_psram = true;
+    cfg.flags.double_fb   = true;
+
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+}
+
+// --- LVGL flush: full frame each time (full_refresh=1), rotated into the panel FB -----
+static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
+    (void)area;
+    lv_color_t *out = px;
+    const int N = SCREEN_W * SCREEN_H;
+    if (s_rot && s_rotBuf) {
+        switch (s_rot) {
+            case 1:  // 90° CW
+                for (int j = 0; j < SCREEN_H; ++j)
+                    for (int i = 0; i < SCREEN_W; ++i)
+                        s_rotBuf[i * SCREEN_H + (SCREEN_H - 1 - j)] = px[j * SCREEN_W + i];
+                break;
+            case 2:  // 180°
+                for (int k = 0; k < N; ++k) s_rotBuf[k] = px[N - 1 - k];
+                break;
+            case 3:  // 270° CW
+                for (int j = 0; j < SCREEN_H; ++j)
+                    for (int i = 0; i < SCREEN_W; ++i)
+                        s_rotBuf[(SCREEN_W - 1 - i) * SCREEN_H + j] = px[j * SCREEN_W + i];
+                break;
+        }
+        out = s_rotBuf;
+    }
+    // Whole-screen blit; double_fb makes this a clean page flip (no tearing).
+    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, SCREEN_W, SCREEN_H, out);
+    s_frameCount++;
+    lv_disp_flush_ready(drv);
+}
+
+// CST820 touch -> LVGL pointer, undoing the display rotation (mirror of display.cpp).
+static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+    (void)drv;
+    uint16_t x, y;
+    if (touch_read(&x, &y)) {
+        uint16_t lx = x, ly = y;
+        switch (s_rot) {
+            case 1: lx = y;                            ly = (uint16_t)(SCREEN_H - 1 - x); break;
+            case 2: lx = (uint16_t)(SCREEN_W - 1 - x); ly = (uint16_t)(SCREEN_H - 1 - y); break;
+            case 3: lx = (uint16_t)(SCREEN_W - 1 - y); ly = x;                            break;
+            default: break;
+        }
+        data->point.x = (lv_coord_t)lx;
+        data->point.y = (lv_coord_t)ly;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+namespace display {
+
+bool begin() {
+    Serial.println("[display] ST7701 480x480 RGB bring-up...");
+
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);   // shared bus: expander + touch + IMU + RTC
+    tca9554_init();
+
+    // Backlight PWM (start dim; main.cpp applies the saved brightness right after).
+    ledcAttach(PIN_LCD_BL, LCD_BL_PWM_FREQ, LCD_BL_PWM_BITS);
+    setBrightness(BRIGHTNESS_DEFAULT);
+
+    tca9554_set(EXIO_LCD_RST, 0);                   // ST7701 hardware reset (EXIO1)
+    delay(10);
+    tca9554_set(EXIO_LCD_RST, 1);
+    delay(50);
+
+    st7701_begin();       // push the ST7701 register init over 3-wire SPI
+    rgb_panel_begin();     // start the RGB parallel refresh + framebuffers
+    Serial.println("[display] panel up; init LVGL...");
+
+    lv_init();
+
+    // Full-screen LVGL draw buffers in PSRAM. full_refresh=1 -> LVGL redraws the whole
+    // frame each refresh, so the flush always gets a complete frame to (optionally) rotate.
+    const size_t px = (size_t)SCREEN_W * SCREEN_H;
+    s_buf1   = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    s_buf2   = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    s_rotBuf = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!s_buf1 || !s_buf2) {
+        Serial.println("[display] LVGL PSRAM buffer alloc FAILED");
+        return false;
+    }
+    lv_disp_draw_buf_init(&s_draw_buf, s_buf1, s_buf2, px);
+
+    lv_disp_drv_init(&s_disp_drv);
+    s_disp_drv.hor_res      = SCREEN_W;
+    s_disp_drv.ver_res      = SCREEN_H;
+    s_disp_drv.flush_cb     = flush_cb;
+    s_disp_drv.draw_buf     = &s_draw_buf;
+    s_disp_drv.full_refresh = 1;
+    lv_disp_drv_register(&s_disp_drv);
+
+    if (touch_begin()) {
+        lv_indev_drv_init(&s_indev_drv);
+        s_indev_drv.type = LV_INDEV_TYPE_POINTER;
+        s_indev_drv.read_cb = touch_read_cb;
+        lv_indev_drv_register(&s_indev_drv);
+        Serial.println("[display] CST820 touch registered");
+    }
+
+    Serial.printf("[display] PSRAM free: %u KB\n", (unsigned)(ESP.getFreePsram() / 1024));
+    ui_create();
+    Serial.println("[display] LVGL ready");
+    return true;
+}
+
+void loop() { lv_timer_handler(); }
+
+// 0..255 -> PWM duty. Backlight is active-high on this board.
+void setBrightness(uint8_t v) {
+    const uint32_t maxDuty = (1u << LCD_BL_PWM_BITS) - 1u;
+    ledcWrite(PIN_LCD_BL, (uint32_t)v * maxDuty / 255u);
+}
+
+void setRotation(uint8_t quarters) {
+    s_rot = (uint8_t)(quarters & 3);
+    lv_obj_t *scr = lv_scr_act();
+    if (scr) lv_obj_invalidate(scr);
+}
+uint8_t rotation() { return s_rot; }
+
+uint32_t inactiveMs() { return lv_disp_get_inactive_time(NULL); }
+
+} // namespace display
+
+#endif  // BOARD_LCD21

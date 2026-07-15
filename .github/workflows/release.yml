@@ -3,6 +3,10 @@ name: Release firmware
 # Push a tag like v1.0.0 to build the merged firmware and attach it to a GitHub
 # Release (a single .bin makers can flash with esptool or the web flasher):
 #   git tag v1.0.0 && git push origin v1.0.0
+#
+# Builds BOTH supported boards:
+#   esp32-s3-amoled-175 -> CapsuleRadar-*        (ESP32-S3-Touch-AMOLED-1.75, CO5300)
+#   esp32-s3-lcd-21     -> CapsuleRadar-lcd21-*  (ESP32-S3-Touch-LCD-2.1, ST7701 480x480)
 
 on:
   push:
@@ -15,6 +19,14 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: esp32-s3-amoled-175
+            name: CapsuleRadar
+          - env: esp32-s3-lcd-21
+            name: CapsuleRadar-lcd21
     steps:
       - uses: actions/checkout@v4
 
@@ -25,33 +37,38 @@ jobs:
       - name: Install PlatformIO + esptool
         run: pip install platformio esptool
 
-      - name: Build firmware
-        run: pio run -e esp32-s3-amoled-175
+      - name: Build firmware (${{ matrix.env }})
+        run: pio run -e ${{ matrix.env }}
 
       - name: Merge into a single flashable binary
         run: |
-          B=.pio/build/esp32-s3-amoled-175
+          B=.pio/build/${{ matrix.env }}
           BOOT_APP0="$(find "$HOME/.platformio/packages" -name boot_app0.bin -path '*framework-arduinoespressif32*' | head -1)"
-          python -m esptool --chip esp32s3 merge_bin -o CapsuleRadar-esp32s3.bin \
+          python -m esptool --chip esp32s3 merge_bin -o ${{ matrix.name }}-esp32s3.bin \
             --flash_mode dio --flash_freq 80m --flash_size 16MB \
             0x0     "$B/bootloader.bin" \
             0x8000  "$B/partitions.bin" \
             0xe000  "$BOOT_APP0" \
             0x10000 "$B/firmware.bin"
-          cp "$B/firmware.bin" CapsuleRadar-ota.bin   # app-only image for the device's web OTA page
+          cp "$B/firmware.bin" ${{ matrix.name }}-ota.bin   # app-only image for the device's web OTA page
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            CapsuleRadar-esp32s3.bin
-            CapsuleRadar-ota.bin
+            ${{ matrix.name }}-esp32s3.bin
+            ${{ matrix.name }}-ota.bin
           generate_release_notes: true
           body: |
-            **First flash (USB):** `CapsuleRadar-esp32s3.bin` — the full merged image (offset `0x0`).
-            - Browser, no toolchain: https://socquique.github.io/capsule-radar/
-            - Or: `esptool.py --chip esp32s3 write_flash 0x0 CapsuleRadar-esp32s3.bin`
+            Two boards are supported. Match the file prefix to your hardware:
 
-            **Update over WiFi (no cable):** `CapsuleRadar-ota.bin` — the app-only image.
-            Open `http://capsuleradar.local/update` on the device and upload this file.
-            (Do **not** upload the merged image there.)
+            **ESP32-S3-Touch-AMOLED-1.75** (CO5300) — `CapsuleRadar-*`
+            **ESP32-S3-Touch-LCD-2.1** (ST7701 480×480) — `CapsuleRadar-lcd21-*`
+
+            **First flash (USB):** `*-esp32s3.bin` — the full merged image (offset `0x0`).
+            - Browser, no toolchain: https://socquique.github.io/capsule-radar/
+            - Or: `esptool.py --chip esp32s3 write_flash 0x0 <file>`
+
+            **Update over WiFi (no cable):** `*-ota.bin` — the app-only image.
+            Open `http://capsuleradar.local/update` on the device and upload the file
+            matching your board. (Do **not** upload the merged image there.)

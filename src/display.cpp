@@ -3,8 +3,9 @@
 // working Arduino_GFX port for this exact panel). The panel runs off the always-on
 // DC1 rail, so it lights up without configuring the AXP2101 PMIC.
 // The actual UI is built by ui_boot_create() (shared with the native SDL sim).
-#include "display.h"
 #include "config.h"
+#if defined(BOARD_AMOLED175)   // AMOLED-only driver; the LCD-2.1 build uses display_st7701.cpp
+#include "display.h"
 #include "radar_view.h"
 #include "ui.h"
 #include "touch_cst9217.h"
@@ -186,3 +187,5 @@ uint8_t rotation() { return s_rot; }
 uint32_t inactiveMs() { return lv_disp_get_inactive_time(NULL); }
 
 } // namespace display
+
+#endif  // BOARD_AMOLED175
