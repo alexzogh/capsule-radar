@@ -247,7 +247,7 @@ static void onRangeChange(float km) {
     p.begin("capsuleradar", false);
     p.putFloat("rangeKm", km);
     p.end();
-    g_requeryKm = constrain(km * 1.6f, 50.0f, 200.0f);
+    g_requeryKm = constrain(km * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
     g_requery = true;
     radar::update(g_snap, g_settings);   // instant visual zoom from the last snapshot
     ui_set_range_km(km);
@@ -911,9 +911,7 @@ void setup() {
 
 #if !defined(DIAG_NO_WIFI)
     // --- ADS-B client + task ----------------------------------------------
-    float queryKm = g_settings.rangeKm * 1.6f;          // query wider than the display range
-    if (queryKm < 50.0f)  queryKm = 50.0f;
-    if (queryKm > 200.0f) queryKm = 200.0f;
+    float queryKm = constrain(g_settings.rangeKm * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
     g_adsb.begin(g_settings.homeLat, g_settings.homeLon, queryKm);
     g_ac_mutex = xSemaphoreCreateMutex();
     // TLS needs a big stack. 32 KB (was 16 KB): the LCD-2.1 build uses ESP-IDF-mode mbedTLS,
@@ -1048,7 +1046,7 @@ void loop() {
                 g_settings.homeLat = glat; g_settings.homeLon = glon;   // radar/coastline recenter
                 // re-query the new area — set the radius too (same formula as boot/zoom), or
                 // adsb_task would re-begin with a stale/zero g_requeryKm and fetch 0 aircraft.
-                g_requeryKm = constrain(g_settings.rangeKm * 1.6f, 50.0f, 200.0f);
+                g_requeryKm = constrain(g_settings.rangeKm * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
                 g_requery = true;                                       // adsb_task re-queries the new area
                 Serial.printf("[gps] re-centred to %.4f, %.4f\n", glat, glon);
             }

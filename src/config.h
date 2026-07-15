@@ -20,8 +20,14 @@
 #define HOME_LON_DEFAULT    0.1059
 
 // ---------- Radar ----------
-#define RANGE_KM_DEFAULT    30.0f          // display range (outer ring). Query is wider, see ADSB_QUERY_KM
-#define ADSB_QUERY_KM       50.0f          // feed query radius (> display: off-range traffic shows as edge arrows)
+#define RANGE_KM_DEFAULT    30.0f          // display range (outer ring). Query is wider, see below.
+// Feed query radius = display range × MULT, clamped to [MIN, MAX]. Querying a bit wider than
+// the display shows off-range traffic as edge arrows. The floor MUST stay small: a large floor
+// (this was 50 km) makes small display ranges still pull a huge aircraft list in busy airspace,
+// which times out the poll and pressures the TLS heap. Keep it tight so shrinking the range works.
+#define ADSB_QUERY_MULT     1.4f
+#define ADSB_QUERY_MIN_KM   12.0f
+#define ADSB_QUERY_MAX_KM   150.0f
 static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define POLL_INTERVAL_MS    2000           // be gentle with the free API (>=1000)
 #define POLL_INTERVAL_BATTERY_MS 5000      // slower polling when running on battery
@@ -44,7 +50,8 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define ADSB_MAX_AIRCRAFT   60              // hard cap parsed per poll (protect RAM in busy areas)
 
 // ---------- Debug ----------
-#define DEBUG_MEM           0               // 1 = print a [mem] heap/fps line every 5s on serial
+#define DEBUG_MEM           1               // 1 = print a [mem] heap/fps line every 5s on serial
+                                            //   (temporarily on for LCD-2.1 crash diagnosis)
 
 // ---------- Common display / UX ----------
 #define LV_COLOR_DEPTH_BITS 16
