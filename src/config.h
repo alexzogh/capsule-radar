@@ -62,7 +62,7 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define SCREEN_H            480
 #define SCREEN_CX           240
 #define SCREEN_CY           240
-#define RADAR_R_OUTER_PX    228            // outer ring radius in px (was 218 on the 466 panel)
+#define RADAR_R_OUTER_PX    236            // outer ring radius in px (fills the 480 round panel)
 
 // ---------- Backlight (PWM on a real GPIO — unlike the AMOLED's panel command) ----------
 #define PIN_LCD_BL          6              // ledc PWM backlight enable/level

@@ -225,7 +225,14 @@ static void grid_draw_cb(lv_event_t *e) {
     lv_draw_arc_dsc_init(&ad);
     ad.color = s_cRing;
     ad.width = 2;
-    const lv_coord_t rr[4] = { 50, 104, 160, RADAR_R_OUTER_PX };
+    // Ring radii scale with the panel's outer radius so the scope fills any screen size.
+    // Ratios are the original 466-panel design (outer 218) -> identical there, larger on 480.
+    const lv_coord_t rr[4] = {
+        (lv_coord_t)(RADAR_R_OUTER_PX * 50 / 218),
+        (lv_coord_t)(RADAR_R_OUTER_PX * 104 / 218),
+        (lv_coord_t)(RADAR_R_OUTER_PX * 160 / 218),
+        RADAR_R_OUTER_PX,
+    };
     const lv_opa_t   ro[4] = { 66, 66, 66, 87 };
     for (int i = 0; i < 4; ++i) { ad.opa = ro[i]; lv_draw_arc(d, &ad, &c, rr[i], 0, 360); }
 

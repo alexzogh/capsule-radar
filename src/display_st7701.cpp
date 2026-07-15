@@ -171,11 +171,12 @@ static bool rgb_panel_begin() {
     cfg.data_width = 16;
     cfg.bits_per_pixel = 16;
     cfg.num_fbs = 2;                        // 2 framebuffers = double-buffered (tear-free page flip).
-    // NO bounce buffer. The bounce-refill ISR does a big PSRAM->SRAM memcpy; when a WiFi/NVS
-    // flash op disables the cache mid-refill it touches inaccessible cached memory and panics
-    // ("Cache disabled but cached memory region accessed" — the crash we hit, A4=0x2580=9600B
-    // = exactly this buffer). Direct-from-PSRAM DMA has no such ISR, so a flash op merely
-    // glitches the image for a moment instead of crashing. (Default bounce size is 0.)
+    // Bounce buffer: smooths PSRAM read latency and kills the horizontal "drift"/jitter of a
+    // direct-from-PSRAM RGB panel. It caused the earlier cache-off panic because its refill
+    // ISR memcpy'd PSRAM from flash-resident code — but that ISR now lives in IRAM
+    // (CONFIG_LCD_RGB_ISR_IRAM_SAFE + CONFIG_GDMA_ISR_IRAM_SAFE, set via custom_sdkconfig), so
+    // it runs safely during WiFi/NVS flash windows. Safe + stable now.
+    cfg.bounce_buffer_size_px = 10 * SCREEN_W;
     cfg.hsync_gpio_num = RGB_HSYNC;
     cfg.vsync_gpio_num = RGB_VSYNC;
     cfg.de_gpio_num    = RGB_DE;
