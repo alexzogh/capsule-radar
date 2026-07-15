@@ -894,6 +894,7 @@ void setup() {
     // --- OTA ---------------------------------------------------------------
     // ArduinoOTA is started from loop() once WiFi connects (see otaUp there).
 
+#if !defined(DIAG_NO_WIFI)
     // --- ADS-B client + task ----------------------------------------------
     float queryKm = g_settings.rangeKm * 1.6f;          // query wider than the display range
     if (queryKm < 50.0f)  queryKm = 50.0f;
@@ -930,14 +931,19 @@ void setup() {
         },
         handleUpdateUpload);
     g_web.begin();
+#else
+    Serial.println("[DIAG] ADS-B task + web server skipped; reaching render loop for display test");
+#endif
 
     Serial.println("setup done");
 }
 
 void loop() {
     display::loop();                // drive LVGL (render dirty areas + run timers)
+#if !defined(DIAG_NO_WIFI)
     g_wm.process();                 // service the WiFi config portal (non-blocking)
     g_web.handleClient();           // serve the configuration web page
+#endif
     if (g_useGps) gps_poll();       // pull NMEA from the LC76G (only when GPS auto-location is on)
 
     // scheduled reboot after a fresh WiFi config (see setSaveConfigCallback)
