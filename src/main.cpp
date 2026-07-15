@@ -97,6 +97,7 @@ static void adsb_task(void*) {
     bool wasConnected = false;
     uint32_t lastPoll = 0;
     uint32_t lastFeedOk = millis();          // self-heal: time of last good (or no-WiFi) poll
+    int      failCount = 0;                  // consecutive poll failures -> exponential backoff
     for (;;) {
         const bool conn = (WiFi.status() == WL_CONNECTED);
         if (conn && !wasConnected) {
@@ -112,8 +113,9 @@ static void adsb_task(void*) {
         // self-heal: a long feed outage while WiFi is up usually means the internal heap
         // fragmented and the TLS handshake can't allocate -> reboot to recover (settings persist).
         if (!conn) lastFeedOk = millis();
-        else if (millis() - lastFeedOk > 180000UL) {
-            Serial.println("[adsb] feed stuck >180s with WiFi up -> restarting to recover");
+        else if (FEED_STUCK_REBOOT_MS > 0 && millis() - lastFeedOk > (uint32_t)FEED_STUCK_REBOOT_MS) {
+            Serial.printf("[adsb] feed stuck >%lus with WiFi up -> restarting to recover\n",
+                          (unsigned long)(FEED_STUCK_REBOOT_MS / 1000));
             delay(100);
             ESP.restart();
         }
@@ -127,10 +129,17 @@ static void adsb_task(void*) {
             // it refreshing even while the user taps around — a slow route/photo lookup (below)
             // can block this single network task, so it must never get ahead of the feed.
             const uint32_t nowMs = millis();
-            const uint32_t pollInterval = g_onBattery ? POLL_INTERVAL_BATTERY_MS : POLL_INTERVAL_MS;
+            uint32_t pollInterval = g_onBattery ? POLL_INTERVAL_BATTERY_MS : POLL_INTERVAL_MS;
+            // Exponential backoff on sustained failures (outage or API rate-limit / HTTP 429):
+            // don't hammer the feed — that only deepens a rate-limit and burns power. Ramps
+            // 2s -> up to 60s, and snaps back to normal on the first success.
+            if (failCount > 0) {
+                uint32_t mult = 1u << (failCount < 5 ? failCount : 5);   // x2 .. x32
+                pollInterval *= mult;
+                if (pollInterval > 60000u) pollInterval = 60000u;        // cap at 60 s
+            }
             if (lastPoll == 0 || nowMs - lastPoll >= pollInterval) {  // aircraft feed
                 lastPoll = nowMs;
-                static int failCount = 0;
                 // poll() flips to the alternate host on failure, so consecutive polls already
                 // alternate hosts; a single transient miss is absorbed by the failCount window.
                 if (g_adsb.poll(fresh)) {
@@ -806,19 +815,11 @@ void setup() {
     loadSettings();
     route_cache_begin();   // clear stale route cache if the label format changed
 
-#if defined(BOARD_LCD21) && !defined(DIAG_NO_WIFI)
-    // ST7701 RGB + WiFi coexistence: bring the WiFi radio (and its one-time RF calibration,
-    // which briefly disables the cache/interrupts) up BEFORE the RGB panel's DMA starts.
-    // Calibrating while the LCD is quiet avoids the interrupt-watchdog reset (TG1WDT_SYS_RST)
-    // that hit when WiFi initialised with the panel already refreshing. WiFiManager's
-    // autoConnect() below then reuses the already-initialised radio. (This mirrors the
-    // ordering in Waveshare's own demo, which starts WiFi before the LCD.)
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();               // triggers esp_wifi_start -> PHY/RF calibration now
-    delay(150);
-    WiFi.disconnect(false);     // drop the stray attempt; radio stays initialised
-    Serial.println("[wifi] radio pre-initialised before RGB panel start");
-#endif
+    // (No WiFi pre-init here. An earlier build brought WiFi up before the panel on a hunch
+    // that RF-cal-vs-RGB ordering caused the crash — it didn't; the IRAM-safe LCD/GDMA ISRs
+    // did. Worse, that early WiFi.begin() left a connect in-flight that collided with
+    // WiFiManager on saved-credential boots -> "sta is connecting, return error" -> dropped
+    // to the setup portal. WiFiManager::autoConnect() owns WiFi start/stop cleanly.)
 
     // --- Display + LVGL (M0) ----------------------------------------------
     // CO5300 AMOLED over QSPI + LVGL draw buffers in PSRAM, then a hello screen.

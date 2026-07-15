@@ -25,6 +25,14 @@
 static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #define POLL_INTERVAL_MS    2000           // be gentle with the free API (>=1000)
 #define POLL_INTERVAL_BATTERY_MS 5000      // slower polling when running on battery
+// Reboot to recover if the feed is stuck this long with WiFi up (heap-fragmentation safety
+// net). Much longer on the RGB board: a transient API rate-limit must NOT trigger a reboot
+// loop there, since a reboot drops the WiFi-setup portal session. 0 = never auto-reboot.
+#if defined(BOARD_LCD21)
+#  define FEED_STUCK_REBOOT_MS 900000      // 15 min
+#else
+#  define FEED_STUCK_REBOOT_MS 180000      // 3 min (AMOLED, original behaviour)
+#endif
 #define MOTION_INTERP       1              // 1 = glyphs glide between polls; 0 = snap to new pos
 #define AC_STALE_MS         15000          // drop aircraft not refreshed in this long
 
