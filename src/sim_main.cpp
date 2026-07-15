@@ -7,6 +7,9 @@
 //
 // Note: the real panel is a 466x466 *round* AMOLED; this square window shows the
 // full buffer, so the corners (hidden on the device) are visible here.
+// Native-only. On device builds (ESP-IDF component mode ignores build_src_filter,
+// so this file gets compiled) this whole unit collapses to nothing.
+#if !defined(ESP_PLATFORM)
 #include <SDL.h>
 #include <lvgl.h>
 #include <stdio.h>
@@ -289,3 +292,4 @@ int main(int argc, char **argv) {
     SDL_Quit();
     return 0;
 }
+#endif  // !ESP_PLATFORM
