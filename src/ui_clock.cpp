@@ -106,39 +106,39 @@ void clock_create() {
     lv_label_set_text(s_lblTime, "--:--");
     lv_obj_set_style_text_font(s_lblTime, &lv_font_montserrat_48, 0);
     lv_obj_set_style_text_color(s_lblTime, CK_GREEN, 0);
-    lv_obj_align(s_lblTime, LV_ALIGN_CENTER, -12, -30);
+    lv_obj_set_style_text_letter_space(s_lblTime, 4, 0);
+    lv_obj_align(s_lblTime, LV_ALIGN_CENTER, -10, -40);
 
-    // Seconds (smaller, dimmer, to the right of the time)
+    // Seconds (to the right of the time)
     s_lblSec = lv_label_create(s_cont);
     lv_label_set_text(s_lblSec, "");
-    lv_obj_set_style_text_font(s_lblSec, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_lblSec, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_color(s_lblSec, CK_SOFT, 0);
     lv_obj_set_style_text_opa(s_lblSec, 180, 0);
-    // Positioned relative to the time label; will be re-aligned after first tick
-    lv_obj_align_to(s_lblSec, s_lblTime, LV_ALIGN_OUT_RIGHT_BOTTOM, 2, -4);
+    lv_obj_align_to(s_lblSec, s_lblTime, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
 
     // Date line
     s_lblDate = lv_label_create(s_cont);
     lv_label_set_text(s_lblDate, "");
-    lv_obj_set_style_text_font(s_lblDate, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_lblDate, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_color(s_lblDate, CK_SOFT, 0);
     lv_obj_set_style_text_opa(s_lblDate, 180, 0);
-    lv_obj_align(s_lblDate, LV_ALIGN_CENTER, 0, 12);
+    lv_obj_align(s_lblDate, LV_ALIGN_CENTER, 0, 16);
 
     // Aircraft count
     s_lblAc = lv_label_create(s_cont);
     lv_label_set_text(s_lblAc, "");
-    lv_obj_set_style_text_font(s_lblAc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_lblAc, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_lblAc, CK_DIM, 0);
-    lv_obj_align(s_lblAc, LV_ALIGN_CENTER, 0, 50);
+    lv_obj_align(s_lblAc, LV_ALIGN_CENTER, 0, 62);
 
     // Nearest aircraft info
     s_lblNearest = lv_label_create(s_cont);
     lv_label_set_text(s_lblNearest, "");
-    lv_obj_set_style_text_font(s_lblNearest, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_lblNearest, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_lblNearest, CK_DIM, 0);
     lv_obj_set_style_text_opa(s_lblNearest, 160, 0);
-    lv_obj_align(s_lblNearest, LV_ALIGN_CENTER, 0, 72);
+    lv_obj_align(s_lblNearest, LV_ALIGN_CENTER, 0, 90);
 
     // Start hidden
     lv_obj_add_flag(s_cont, LV_OBJ_FLAG_HIDDEN);
@@ -158,8 +158,7 @@ void clock_show() {
     lv_obj_clear_flag(s_cont, LV_OBJ_FLAG_HIDDEN);
     // Immediate tick so the clock shows the current time right away
     clock_tick_cb(nullptr);
-    // Re-align seconds label next to the (now-populated) time
-    lv_obj_align_to(s_lblSec, s_lblTime, LV_ALIGN_OUT_RIGHT_BOTTOM, 2, -4);
+    lv_obj_align_to(s_lblSec, s_lblTime, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -4);
     // Start the 1 s timer
     if (!s_timer) {
         s_timer = lv_timer_create(clock_tick_cb, 1000, nullptr);

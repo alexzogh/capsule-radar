@@ -56,6 +56,7 @@ static int                   g_rotation = 0;                         // display 
 static bool                  g_useGps = false;                       // auto-set home from the LC76G GPS (-G variant) (web/NVS)
 static int                   g_trailLen = 2;                         // aircraft trails 0=off 1=short 2=med 3=long (web/NVS)
 static int                   g_maxAc = 20;                           // max aircraft drawn on the scope (web/NVS)
+static bool                  g_clockEnabled = true;                  // show clock face on idle (web/NVS)
 static volatile bool         g_onBattery = false;                    // discharging (set on core 1, read on core 0)
 static bool                  g_rtcSynced = false;                    // RTC written from NTP this session?
 static std::vector<Aircraft> g_snap;                                 // last snapshot (instant re-render on zoom)
@@ -201,6 +202,7 @@ static void loadSettings() {
     g_idleDimMs        = p.getUInt("idledim", IDLE_DIM_MS);
     g_units            = p.getInt("units", 0);
     g_tz               = p.getString("tz", TZ_STR);
+    g_clockEnabled     = p.getBool("clock", true);
     p.end();
 }
 
@@ -457,6 +459,7 @@ static void handleRoot() {
         "<label>Aircraft trails</label><select onchange='tl(this.value)'>%s</select>"
         "<label>Max aircraft on screen</label><select onchange='mx(this.value)'>%s</select>"
         "<label>Screen rotation (USB-C position)</label><select onchange='ro(this.value)'>%s</select>"
+        "<label><input type=checkbox class=ck %s onchange='ck(this.checked)'>Show clock on idle</label>"
         "<label>Units</label><select onchange='u(this.value)'>%s</select></div>"
         "<div class=card><div class=t>Sound</div>"
         "<label>Volume</label>"
@@ -493,6 +496,7 @@ static void handleRoot() {
         "function u(v){fetch('/units?v='+v+'&save=1')}"
         "function al(v){fetch('/alerts?mode='+v+'&save=1')}"
         "function px(v){fetch('/alerts?prox='+v+'&save=1')}"
+        "function ck(c){fetch('/clock?v='+(c?1:0)+'&save=1')}"
         "function gp(c){fetch('/gps?v='+(c?1:0)+'&save=1')}"
         // auto-pick the visitor's time zone from their browser clock (only if they haven't set one)
         "var TZSET=%d;(function(){if(TZSET)return;"
@@ -506,7 +510,7 @@ static void handleRoot() {
         tzopts.c_str(),
         g_brightnessDay, iopts.c_str(), g_showSweep ? "checked" : "",
         g_showAirports ? "checked" : "", g_hideGround ? "checked" : "", maopts.c_str(), g_milOnly ? "checked" : "",
-        tlopts.c_str(), mxopts.c_str(), rotopts.c_str(), uopts.c_str(),
+        tlopts.c_str(), mxopts.c_str(), rotopts.c_str(), g_clockEnabled ? "checked" : "", uopts.c_str(),
         g_volume, g_muted ? "checked" : "", aopts.c_str(), popts.c_str(),
         g_settings.homeLat, g_settings.homeLon, (g_tz == TZ_STR ? 0 : 1));
     g_web.send(200, "text/html", buf);
@@ -759,6 +763,20 @@ static void handleGps() {   // auto-set the centre point from the LC76G GPS (-G 
     g_web.send(200, "text/plain", "ok");
 }
 
+static void handleClock() {   // enable/disable clock face on idle (live)
+    if (g_web.hasArg("v")) {
+        g_clockEnabled = g_web.arg("v").toInt() != 0;
+        if (!g_clockEnabled && clock_visible()) clock_hide();
+        if (g_web.hasArg("save")) {
+            Preferences p;
+            p.begin("capsuleradar", false);
+            p.putBool("clock", g_clockEnabled);
+            p.end();
+        }
+    }
+    g_web.send(200, "text/plain", "ok");
+}
+
 // ---- browser OTA: upload an app .bin over WiFi and self-flash ----
 static void handleUpdatePage() {
     g_web.send(200, "text/html",
@@ -938,6 +956,7 @@ void setup() {
     g_web.on("/maxac", handleMaxAc);
     g_web.on("/rotate", handleRotate);
     g_web.on("/gps", handleGps);
+    g_web.on("/clock", handleClock);
     g_web.on("/units", handleUnits);
     g_web.on("/update", HTTP_GET, handleUpdatePage);
     g_web.on("/update", HTTP_POST,
@@ -1104,7 +1123,7 @@ void loop() {
             g_idle = idle;
             applyBrightness();
             // Clock overlay: show on idle, hide on wake
-            if (idle && !sleep) {
+            if (idle && !sleep && g_clockEnabled) {
                 clock_show();
                 // Use a moderate brightness for the clock (readable but power-saving)
                 display::setBrightness(constrain(g_brightnessDay / 2, BRIGHTNESS_IDLE, 100));

@@ -97,6 +97,7 @@ static int         s_frameCtr     = 0;
 static lv_coord_t  s_cx = SCREEN_CX, s_cy = SCREEN_CY;
 static std::string s_selHex;
 static std::string s_trackHex;              // hex of tracked aircraft (empty = not tracking)
+static double      s_trackLat = 0.0, s_trackLon = 0.0;  // tracked aircraft position (projection center)
 static float       s_rangeKm = RANGE_KM_DEFAULT;  // cached for draw callbacks (CPA / projected path)
 static double      s_rotationDeg = 0.0;            // cached rotation for draw callbacks
 
@@ -836,51 +837,47 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
         }
     }
 
-    // --- tracking: auto-center the scope on the tracked aircraft ---
+    // --- tracking: reproject around the tracked aircraft's position ---
+    static bool wasTracking = false;
     if (!s_trackHex.empty()) {
         bool found = false;
         for (const Aircraft &ac : aircraft) {
             if (s_trackHex == ac.hex.c_str()) {
-                const double tDistKm = geo::haversineKm(s.homeLat, s.homeLon, ac.lat, ac.lon);
-                const double tBrg    = geo::bearingDeg(s.homeLat, s.homeLon, ac.lat, ac.lon);
-                // Project at normal center to find where it would land...
-                const geo::Point tp = geo::projectToScreen(tDistKm, tBrg, s.rangeKm,
-                                        (float)SCREEN_CX, (float)SCREEN_CY, R, s.rotationDeg);
-                // ...then shift the scope so that point sits at screen center
-                s_cx = (lv_coord_t)(SCREEN_CX + (SCREEN_CX - (int)tp.x));
-                s_cy = (lv_coord_t)(SCREEN_CY + (SCREEN_CY - (int)tp.y));
+                s_trackLat = ac.lat;
+                s_trackLon = ac.lon;
                 found = true;
                 break;
             }
         }
         if (!found) {
-            // Tracked aircraft left the feed — stop tracking, reset center
             s_trackHex.clear();
-            s_cx = SCREEN_CX;
-            s_cy = SCREEN_CY;
         }
-        // Reproject coastline/airports for the shifted center
-        coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
-        airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+    }
+    const bool nowTracking = !s_trackHex.empty();
+    if (nowTracking != wasTracking) {
+        const double cLat = nowTracking ? s_trackLat : s.homeLat;
+        const double cLon = nowTracking ? s_trackLon : s.homeLon;
+        coastline_project(cLat, cLon, s.rangeKm, SCREEN_CX, SCREEN_CY, R);
+        airports_project(cLat, cLon, s.rangeKm, SCREEN_CX, SCREEN_CY, R);
         if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
-    } else {
-        // Not tracking: ensure center is at screen center
-        if (s_cx != SCREEN_CX || s_cy != SCREEN_CY) {
-            s_cx = SCREEN_CX;
-            s_cy = SCREEN_CY;
-            coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
-            airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
-            if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
-        }
+        wasTracking = nowTracking;
+    } else if (nowTracking) {
+        coastline_project(s_trackLat, s_trackLon, s.rangeKm, SCREEN_CX, SCREEN_CY, R);
+        airports_project(s_trackLat, s_trackLon, s.rangeKm, SCREEN_CX, SCREEN_CY, R);
+        if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
     }
 
     std::map<std::string, lv_point_t> prevPos;        // smooth-motion: glide starts here
     for (const AcDraw &a : s_acs) prevPos[a.hex] = a.pos;
 
+    const double projLat = nowTracking ? s_trackLat : s.homeLat;
+    const double projLon = nowTracking ? s_trackLon : s.homeLon;
+
     for (const Aircraft &ac : aircraft) {
-        const double distKm = geo::haversineKm(s.homeLat, s.homeLon, ac.lat, ac.lon);
-        const double brg = geo::bearingDeg(s.homeLat, s.homeLon, ac.lat, ac.lon);
-        const geo::Point p = geo::projectToScreen(distKm, brg, s.rangeKm, s_cx, s_cy, R, s.rotationDeg);
+        const double distKm = geo::haversineKm(projLat, projLon, ac.lat, ac.lon);
+        const double brg = geo::bearingDeg(projLat, projLon, ac.lat, ac.lon);
+        const geo::Point p = geo::projectToScreen(distKm, brg, s.rangeKm,
+                                (float)SCREEN_CX, (float)SCREEN_CY, R, s.rotationDeg);
 
         AcDraw d;
         lv_point_t target;
@@ -892,11 +889,11 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
             if (pit != prevPos.end()) {
                 const long dx = (long)target.x - pit->second.x;
                 const long dy = (long)target.y - pit->second.y;
-                d.from = (dx * dx + dy * dy > 120L * 120L) ? target : pit->second;  // snap if it jumped
-            } else d.from = target;                                                  // new contact: appear in place
+                d.from = (dx * dx + dy * dy > 120L * 120L) ? target : pit->second;
+            } else d.from = target;
         }
 #if MOTION_INTERP
-        d.pos = d.from;                  // begin the glide at the previous position
+        d.pos = d.from;
 #else
         d.pos = target;
         d.from = target;
@@ -912,8 +909,10 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
         d.onGround = ac.onGround;
         d.vsFpm = ac.baroRate;
         d.gsKt = ac.gs;
-        d.distKm = (float)distKm;
-        d.bearingDeg = (float)brg;
+        const double homeDist = geo::haversineKm(s.homeLat, s.homeLon, ac.lat, ac.lon);
+        const double homeBrg  = geo::bearingDeg(s.homeLat, s.homeLon, ac.lat, ac.lon);
+        d.distKm = (float)homeDist;
+        d.bearingDeg = (float)homeBrg;
         d.squawk = ac.squawk;
         if (ac.onGround) snprintf(d.altTxt, sizeof(d.altTxt), "GND");
         else             snprintf(d.altTxt, sizeof(d.altTxt), "%.0f ft", (double)ac.altBaro);
@@ -1024,31 +1023,18 @@ static void fill_info(const AcDraw &a, AcInfo &out) {
 
 void select(int idx) {
     if (idx < 0 || idx >= (int)s_acs.size()) {
-        // Tapped empty space — clear both selection and tracking, reset center
         s_selHex.clear();
-        if (!s_trackHex.empty()) {
-            s_trackHex.clear();
-            s_cx = SCREEN_CX;
-            s_cy = SCREEN_CY;
-        }
+        s_trackHex.clear();
     } else {
         const std::string tapped = s_acs[idx].hex;
         if (!s_trackHex.empty() && s_trackHex == tapped) {
-            // Tapped the tracked aircraft again — stop tracking, reset center
             s_trackHex.clear();
             s_selHex.clear();
-            s_cx = SCREEN_CX;
-            s_cy = SCREEN_CY;
         } else if (!s_selHex.empty() && s_selHex == tapped && s_trackHex.empty()) {
-            // Tapped the already-selected (but not tracked) aircraft — start tracking
             s_trackHex = tapped;
+            s_selHex.clear();  // hide detail card while tracking
         } else {
-            // Tapped a different aircraft — select it, clear any active tracking
-            if (!s_trackHex.empty()) {
-                s_trackHex.clear();
-                s_cx = SCREEN_CX;
-                s_cy = SCREEN_CY;
-            }
+            s_trackHex.clear();
             s_selHex = tapped;
         }
     }
