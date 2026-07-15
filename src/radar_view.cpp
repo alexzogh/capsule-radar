@@ -96,6 +96,9 @@ static uint32_t    s_pollMs       = POLL_INTERVAL_MS;
 static int         s_frameCtr     = 0;
 static lv_coord_t  s_cx = SCREEN_CX, s_cy = SCREEN_CY;
 static std::string s_selHex;
+static std::string s_trackHex;              // hex of tracked aircraft (empty = not tracking)
+static float       s_rangeKm = RANGE_KM_DEFAULT;  // cached for draw callbacks (CPA / projected path)
+static double      s_rotationDeg = 0.0;            // cached rotation for draw callbacks
 
 struct FlowSeg { lv_point_t a, b; uint16_t gen; };   // gen = the poll it was laid down on
 static std::deque<FlowSeg> s_flow;
@@ -299,7 +302,7 @@ static void wedge_bbox(float deg, lv_area_t *out) {
 static inline lv_area_t glyph_bbox(lv_point_t p) {
     lv_area_t a;
     if (orb()) { a.x1 = p.x - 30; a.y1 = p.y - 30; a.x2 = p.x + 30;  a.y2 = p.y + 30; }
-    else          { a.x1 = p.x - 22; a.y1 = p.y - 22; a.x2 = p.x + 148; a.y2 = p.y + 26; }
+    else          { a.x1 = p.x - 22; a.y1 = p.y - 22; a.x2 = p.x + 148; a.y2 = p.y + 40; }
     return a;
 }
 static inline void area_union(lv_area_t &d, const lv_area_t &s) {
@@ -498,6 +501,103 @@ static void ac_draw_cb(lv_event_t *e) {
             }
         }
 
+        // projected flight path + CPA for the tracked aircraft
+        if (!s_trackHex.empty() && s_trackHex == ac.hex &&
+            ac.gsKt > 0 && !isnan(ac.track) && ac.inRange) {
+            const float R = (float)RADAR_R_OUTER_PX;
+            const float gsKmPerSec = ac.gsKt * 1.852f / 3600.0f;
+            // heading in screen coords (adjusted for scope rotation)
+            const float headingRad = (float)((ac.track - s_rotationDeg) * M_PI / 180.0);
+
+            // Draw dashed projected path line (dots every 15s, markers at 60/120/180s)
+            lv_draw_rect_dsc_t dot;
+            lv_draw_rect_dsc_init(&dot);
+            dot.bg_color = lv_color_hex(0x00E5FF);  // cyan
+            dot.bg_opa = LV_OPA_COVER;
+            dot.radius = LV_RADIUS_CIRCLE;
+            for (int t = 15; t <= 180; t += 15) {
+                const float futDistKm = gsKmPerSec * (float)t;
+                const float futDistPx = (futDistKm / s_rangeKm) * R;
+                const lv_coord_t fx = (lv_coord_t)(ac.pos.x + (lv_coord_t)lroundf(futDistPx * sinf(headingRad)));
+                const lv_coord_t fy = (lv_coord_t)(ac.pos.y - (lv_coord_t)lroundf(futDistPx * cosf(headingRad)));
+                if (fx < -20 || fx > SCREEN_W + 20 || fy < -20 || fy > SCREEN_H + 20) break;
+
+                const bool isMinute = (t % 60 == 0);
+                const int minuteIdx = t / 60;  // 1, 2, or 3
+                const lv_opa_t opa = isMinute
+                    ? (lv_opa_t)(255 - (minuteIdx - 1) * 60)   // 255, 195, 135
+                    : (lv_opa_t)90;
+                dot.bg_opa = opa;
+                const lv_coord_t r = isMinute ? 4 : 2;
+                lv_area_t dr = { (lv_coord_t)(fx - r), (lv_coord_t)(fy - r),
+                                 (lv_coord_t)(fx + r), (lv_coord_t)(fy + r) };
+                lv_draw_rect(d, &dot, &dr);
+
+                // Time label at each minute marker
+                if (isMinute) {
+                    char tbuf[8];
+                    snprintf(tbuf, sizeof(tbuf), "%dm", minuteIdx);
+                    lv_draw_label_dsc_t tl;
+                    lv_draw_label_dsc_init(&tl);
+                    tl.font = &lv_font_montserrat_12;
+                    tl.color = lv_color_hex(0x00E5FF);
+                    tl.opa = opa;
+                    lv_area_t ta = { (lv_coord_t)(fx + 6), (lv_coord_t)(fy - 6),
+                                     (lv_coord_t)(fx + 40), (lv_coord_t)(fy + 10) };
+                    lv_draw_label(d, &tl, &ta, tbuf, NULL);
+                }
+            }
+
+            // --- CPA (closest point of approach) indicator ---
+            // Simple linear CPA: the aircraft flies a straight line from its current
+            // position; find the time when distance to screen center (home) is minimal.
+            // In screen coords: home is at (s_cx, s_cy), aircraft at ac.pos, velocity
+            // direction is headingRad. CPA time = -dot(rel, vel) / dot(vel, vel).
+            const float vx = sinf(headingRad);
+            const float vy = -cosf(headingRad);
+            const float rx = (float)(ac.pos.x - s_cx);
+            const float ry = (float)(ac.pos.y - s_cy);
+            const float dotRV = rx * vx + ry * vy;
+            // dotRV < 0 means approaching; tCpa > 0 means the CPA is in the future
+            const float tCpaSec = (gsKmPerSec > 0.001f)
+                ? (-dotRV / ((gsKmPerSec / s_rangeKm) * R))  // in seconds
+                : 0.0f;
+
+            if (tCpaSec > 0.0f && tCpaSec < 600.0f) {  // CPA is in the future and within 10 min
+                // Compute CPA distance in km
+                const float cpaPx = sqrtf((rx + vx * (gsKmPerSec / s_rangeKm) * R * tCpaSec) *
+                                          (rx + vx * (gsKmPerSec / s_rangeKm) * R * tCpaSec) +
+                                          (ry + vy * (gsKmPerSec / s_rangeKm) * R * tCpaSec) *
+                                          (ry + vy * (gsKmPerSec / s_rangeKm) * R * tCpaSec));
+                const float cpaKm = cpaPx * s_rangeKm / R;
+
+                char cpaBuf[40];
+                if (tCpaSec < 60.0f)
+                    snprintf(cpaBuf, sizeof(cpaBuf), "CPA %.1fkm %ds", (double)cpaKm, (int)tCpaSec);
+                else
+                    snprintf(cpaBuf, sizeof(cpaBuf), "CPA %.1fkm %dm%ds", (double)cpaKm,
+                             (int)(tCpaSec / 60.0f), (int)tCpaSec % 60);
+
+                lv_draw_label_dsc_t cl;
+                lv_draw_label_dsc_init(&cl);
+                cl.font = &lv_font_montserrat_12;
+                cl.color = lv_color_hex(0x00E5FF);
+                cl.opa = 220;
+                // Position CPA label below the aircraft glyph
+                lv_area_t ca = { (lv_coord_t)(ac.pos.x - 50), (lv_coord_t)(ac.pos.y + 22),
+                                 (lv_coord_t)(ac.pos.x + 80), (lv_coord_t)(ac.pos.y + 38) };
+                lv_draw_label(d, &cl, &ca, cpaBuf, NULL);
+            }
+
+            // Tracking ring: double ring to distinguish from normal selection
+            lv_draw_arc_dsc_t tr;
+            lv_draw_arc_dsc_init(&tr);
+            tr.color = lv_color_hex(0x00E5FF);  // cyan
+            tr.width = 2;
+            tr.opa = 200;
+            lv_draw_arc(d, &tr, &ac.pos, 22, 0, 360);
+        }
+
         // floating labels (phosphor only; orb keeps clean balls + the tap card)
         if (!drg) {
             lv_draw_label_dsc_t lc;
@@ -640,6 +740,7 @@ void init(void *lv_parent) {
     s_trails.clear();
     s_flow.clear();
     s_selHex.clear();
+    s_trackHex.clear();
     s_flowRedrawCtr = 0;
 
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
@@ -713,6 +814,8 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
     out.reserve(aircraft.size());
     std::set<std::string> present;
     const float R = (float)RADAR_R_OUTER_PX;
+    s_rangeKm = s.rangeKm;                       // cache for draw callbacks
+    s_rotationDeg = s.rotationDeg;
     ++s_flowGen;                                  // one tick per poll; flow segments age in these units
 
     // Reproject the coastline only when the scope geometry actually changes (home
@@ -730,6 +833,44 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
             s_trails.clear();
             s_flow.clear();
             flow_redraw_all();
+        }
+    }
+
+    // --- tracking: auto-center the scope on the tracked aircraft ---
+    if (!s_trackHex.empty()) {
+        bool found = false;
+        for (const Aircraft &ac : aircraft) {
+            if (s_trackHex == ac.hex.c_str()) {
+                const double tDistKm = geo::haversineKm(s.homeLat, s.homeLon, ac.lat, ac.lon);
+                const double tBrg    = geo::bearingDeg(s.homeLat, s.homeLon, ac.lat, ac.lon);
+                // Project at normal center to find where it would land...
+                const geo::Point tp = geo::projectToScreen(tDistKm, tBrg, s.rangeKm,
+                                        (float)SCREEN_CX, (float)SCREEN_CY, R, s.rotationDeg);
+                // ...then shift the scope so that point sits at screen center
+                s_cx = (lv_coord_t)(SCREEN_CX + (SCREEN_CX - (int)tp.x));
+                s_cy = (lv_coord_t)(SCREEN_CY + (SCREEN_CY - (int)tp.y));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            // Tracked aircraft left the feed — stop tracking, reset center
+            s_trackHex.clear();
+            s_cx = SCREEN_CX;
+            s_cy = SCREEN_CY;
+        }
+        // Reproject coastline/airports for the shifted center
+        coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+        airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+        if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
+    } else {
+        // Not tracking: ensure center is at screen center
+        if (s_cx != SCREEN_CX || s_cy != SCREEN_CY) {
+            s_cx = SCREEN_CX;
+            s_cy = SCREEN_CY;
+            coastline_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+            airports_project(s.homeLat, s.homeLon, s.rangeKm, s_cx, s_cy, R);
+            if (s_gridLayer) lv_obj_invalidate(s_gridLayer);
         }
     }
 
@@ -808,6 +949,11 @@ void update(const std::vector<Aircraft> &aircraft, const RadarSettings &s) {
         else ++it;
     }
     if (!s_selHex.empty() && present.find(s_selHex) == present.end()) s_selHex.clear();
+    if (!s_trackHex.empty() && present.find(s_trackHex) == present.end()) {
+        s_trackHex.clear();
+        s_cx = SCREEN_CX;
+        s_cy = SCREEN_CY;
+    }
 
     // Fade the flow layer by AGE, not just count: drop segments older than s_flowGenMax
     // polls so old tracks self-clear even in busy airspace (a 5 nm view doesn't stay caked
@@ -877,8 +1023,35 @@ static void fill_info(const AcDraw &a, AcInfo &out) {
 }
 
 void select(int idx) {
-    if (idx < 0 || idx >= (int)s_acs.size()) s_selHex.clear();
-    else s_selHex = s_acs[idx].hex;
+    if (idx < 0 || idx >= (int)s_acs.size()) {
+        // Tapped empty space — clear both selection and tracking, reset center
+        s_selHex.clear();
+        if (!s_trackHex.empty()) {
+            s_trackHex.clear();
+            s_cx = SCREEN_CX;
+            s_cy = SCREEN_CY;
+        }
+    } else {
+        const std::string tapped = s_acs[idx].hex;
+        if (!s_trackHex.empty() && s_trackHex == tapped) {
+            // Tapped the tracked aircraft again — stop tracking, reset center
+            s_trackHex.clear();
+            s_selHex.clear();
+            s_cx = SCREEN_CX;
+            s_cy = SCREEN_CY;
+        } else if (!s_selHex.empty() && s_selHex == tapped && s_trackHex.empty()) {
+            // Tapped the already-selected (but not tracked) aircraft — start tracking
+            s_trackHex = tapped;
+        } else {
+            // Tapped a different aircraft — select it, clear any active tracking
+            if (!s_trackHex.empty()) {
+                s_trackHex.clear();
+                s_cx = SCREEN_CX;
+                s_cy = SCREEN_CY;
+            }
+            s_selHex = tapped;
+        }
+    }
     if (s_acLayer) lv_obj_invalidate(s_acLayer);
 }
 
@@ -904,5 +1077,15 @@ bool info(int idx, AcInfo &out) {
 }
 
 void tickSweep() { /* sweep self-animates via lv_timer */ }
+
+bool isTracking() { return !s_trackHex.empty(); }
+
+void clearTrack() {
+    if (s_trackHex.empty()) return;
+    s_trackHex.clear();
+    s_cx = SCREEN_CX;
+    s_cy = SCREEN_CY;
+    if (s_acLayer) lv_obj_invalidate(s_acLayer);
+}
 
 } // namespace radar

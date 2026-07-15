@@ -50,6 +50,11 @@ int  hitTest(int x, int y);
 void select(int idx);
 bool selected(AcInfo& out);                 // false if nothing selected/visible
 
+// Tracking: tap a selected aircraft a second time to lock the scope on it.
+// The scope auto-centers on the tracked aircraft and draws a projected flight path.
+bool isTracking();
+void clearTrack();
+
 // Snapshot access for the list / stats views.
 int  count();
 int  countInRange();                        // aircraft within the display range (for the HUD)

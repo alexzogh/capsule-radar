@@ -13,6 +13,7 @@
 #include "photo_client.h"
 #include "radar_view.h"
 #include "ui.h"
+#include "ui_clock.h"                // clock face idle-mode overlay
 #include "display.h"                  // M0: CO5300 + LVGL bring-up
 #include "imu_qmi8658.h"             // face-down sleep
 #include "gps.h"                     // LC76G GNSS (-G variant only)
@@ -855,6 +856,7 @@ void setup() {
     ui_set_range_cb(onRangeChange);              // on-screen zoom button
     ui_set_units(g_units);                       // apply saved unit preset
     ui_set_range_km(g_settings.rangeKm);         // show the loaded range
+    clock_create();                              // clock face overlay (idle mode)
 
     imu_begin();       // face-down sleep (no-op if the IMU isn't detected)
     battery_begin();   // AXP2101 (no-op if not detected / no battery)
@@ -1053,7 +1055,34 @@ void loop() {
         }
     }
 
-    // face-down -> screen off (IMU); flip face-up to wake
+    // Clock face update: when the clock overlay is visible, feed it the latest
+    // aircraft data every second so the count/nearest info stays fresh.
+    if (clock_visible()) {
+        static uint32_t lastClk = 0;
+        if (millis() - lastClk > 1000) {
+            lastClk = millis();
+            int acCount = 0;
+            char nearCall[16] = "";
+            float nearDist = 1e9f, nearAlt = 0.0f;
+            if (xSemaphoreTake(g_ac_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                acCount = (int)g_aircraft.size();
+                for (const Aircraft &ac : g_aircraft) {
+                    const double d = geo::haversineKm(g_settings.homeLat, g_settings.homeLon, ac.lat, ac.lon);
+                    if (d < nearDist) {
+                        nearDist = (float)d;
+                        nearAlt  = ac.altBaro;
+                        snprintf(nearCall, sizeof(nearCall), "%s",
+                                 ac.flight.length() > 0 ? ac.flight.c_str() : ac.hex.c_str());
+                    }
+                }
+                xSemaphoreGive(g_ac_mutex);
+            }
+            clock_update(acCount, nearCall[0] ? nearCall : nullptr, nearDist, nearAlt);
+        }
+    }
+
+    // face-down -> screen off (IMU); flip face-up to wake.
+    // Also: shake-to-wake from clock idle mode, and clock show/hide on idle transitions.
     static uint32_t lastImu = 0;
     static int fdCount = 0;
     if (millis() - lastImu > 400) {
@@ -1061,12 +1090,27 @@ void loop() {
         const int fd = imu_facedown();              // 1 down, 0 not, -1 read error
         if (fd > 0)       { if (fdCount < 8) fdCount++; }
         else if (fd == 0) fdCount = 0;              // -1 (I2C hiccup): leave the counter as-is
+
+        // Shake-to-wake: if the clock is visible and the device is shaken, wake up
+        if (clock_visible() && imu_shaken()) {
+            // Reset the LVGL inactivity timer so the idle check below sees "active"
+            lv_disp_trig_activity(NULL);
+        }
+
         const bool sleep = (fdCount >= 4);   // ~1.6 s face-down
         const bool idle  = g_idleDimMs > 0 && display::inactiveMs() > g_idleDimMs;
         if (sleep != g_asleep || idle != g_idle) {
             g_asleep = sleep;
             g_idle = idle;
             applyBrightness();
+            // Clock overlay: show on idle, hide on wake
+            if (idle && !sleep) {
+                clock_show();
+                // Use a moderate brightness for the clock (readable but power-saving)
+                display::setBrightness(constrain(g_brightnessDay / 2, BRIGHTNESS_IDLE, 100));
+            } else if (!idle) {
+                clock_hide();
+            }
         }
     }
 

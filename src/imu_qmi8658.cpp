@@ -53,6 +53,42 @@ bool imu_begin() {
     return false;
 }
 
+// Read all three accel axes (X, Y, Z) for shake detection.
+// Returns true if reads succeeded; fills ax, ay, az in raw LSB (±2 g = 16384 LSB/g).
+#define QMI_AX_L  0x35
+static bool read_accel_xyz(int16_t &ax, int16_t &ay, int16_t &az) {
+    if (!s_ok) return false;
+    uint8_t b[6];
+    if (!rd(QMI_AX_L, b, 6)) return false;
+    ax = (int16_t)((b[1] << 8) | b[0]);
+    ay = (int16_t)((b[3] << 8) | b[2]);
+    az = (int16_t)((b[5] << 8) | b[4]);
+    return true;
+}
+
+// Shake detection: compare the magnitude of acceleration against the gravity
+// baseline (1 g ~ 16384 LSB). A spike above ~1.4 g indicates the device was
+// picked up, tapped, or shaken. Debounce: true at most once per 800 ms.
+#define SHAKE_THRESHOLD  5600   // LSB above/below 1g magnitude (~0.34 g delta)
+#define SHAKE_COOLDOWN_MS 800
+bool imu_shaken() {
+    int16_t ax, ay, az;
+    if (!read_accel_xyz(ax, ay, az)) return false;
+    // Compute |accel| via integer math (avoid float sqrt on ESP32 in tight loop).
+    // magnitude^2 in units of LSB^2; compare against (1g ± threshold)^2.
+    const int32_t mag2 = (int32_t)ax * ax + (int32_t)ay * ay + (int32_t)az * az;
+    const int32_t g = 16384;   // 1 g in LSB at ±2 g scale
+    const int32_t lo = g - SHAKE_THRESHOLD;
+    const int32_t hi = g + SHAKE_THRESHOLD;
+    const bool spike = (mag2 > (int32_t)hi * hi) || (mag2 < (int32_t)lo * lo);
+    if (!spike) return false;
+    static uint32_t lastShake = 0;
+    const uint32_t now = millis();
+    if (now - lastShake < SHAKE_COOLDOWN_MS) return false;
+    lastShake = now;
+    return true;
+}
+
 // 1 = face-down, 0 = not, -1 = couldn't read (shared I2C bus is noisy — a failed read
 // must NOT be treated as "not face-down", or it keeps resetting the debounce counter and
 // the screen never sleeps).
