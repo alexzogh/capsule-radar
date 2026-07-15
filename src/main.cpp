@@ -916,7 +916,10 @@ void setup() {
     if (queryKm > 200.0f) queryKm = 200.0f;
     g_adsb.begin(g_settings.homeLat, g_settings.homeLon, queryKm);
     g_ac_mutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(adsb_task, "adsb", 16384, nullptr, 1, nullptr, 0);  // TLS needs a big stack
+    // TLS needs a big stack. 32 KB (was 16 KB): the LCD-2.1 build uses ESP-IDF-mode mbedTLS,
+    // whose handshake is more stack-hungry than the AMOLED precompiled libs — 16 KB overflowed
+    // and panicked mid-poll (esp_restart_noos in the crash decode). Extra headroom is cheap.
+    xTaskCreatePinnedToCore(adsb_task, "adsb", 32768, nullptr, 1, nullptr, 0);
 
     // configuration web page (http://capsuleradar.local/)
     g_web.on("/", handleRoot);
