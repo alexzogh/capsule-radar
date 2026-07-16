@@ -4,6 +4,7 @@
   <a href="https://socquique.github.io/capsule-radar/"><img src="https://img.shields.io/badge/Flash%20in%20browser-FF6D00?logo=googlechrome&logoColor=white" alt="Flash in browser"></a>
   <a href="https://makerworld.com/en/models/2907695-capsule-radar-live-flight-radar-desk-gadget"><img src="https://img.shields.io/badge/MakerWorld-3D%20case-1A8917?logo=bambulab&logoColor=white" alt="MakerWorld – 3D case"></a>
   <img src="https://img.shields.io/badge/board-ESP32--S3%20round%20AMOLED-E7352C?logo=espressif&logoColor=white" alt="Board: ESP32-S3 round AMOLED">
+  <img src="https://img.shields.io/badge/board-ESP32--S3%20Touch%20LCD%202.1-E7352C?logo=espressif&logoColor=white" alt="Board: ESP32-S3 Touch LCD 2.1">
   <a href="https://github.com/socquique/capsule-radar/releases"><img src="https://img.shields.io/github/v/tag/socquique/capsule-radar?label=firmware&color=7B42BC" alt="Firmware version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/code-MIT-2088FF" alt="License: MIT"></a>
   <img src="https://img.shields.io/github/languages/count/socquique/capsule-radar?label=languages&color=FFC107" alt="Languages">
@@ -15,7 +16,7 @@
 </p>
 <p align="center"><sub>A real flight on the device: callsign, type, altitude/speed, <b>route</b> (Lisbon → Abu Dhabi) and the <b>aircraft photo</b> — all looked up automatically.</sub></p>
 
-A live **ADS-B aircraft radar** for the **Waveshare ESP32-S3-Touch-AMOLED-1.75** — a round 466×466 AMOLED with capacitive touch. It pulls nearby aircraft from a free online feed over WiFi and plots them on a touch radar scope centered on your location, with live flight details and selectable visual skins.
+A live **ADS-B aircraft radar** for the **Waveshare ESP32-S3-Touch-AMOLED-1.75** (round 466×466 AMOLED) and the **Waveshare ESP32-S3-Touch-LCD-2.1** (round 480×480 IPS LCD). It pulls nearby aircraft from a free online feed over WiFi and plots them on a touch radar scope centered on your location, with live flight details and selectable visual skins.
 
 > Visual reference: open [`assets/plane_radar_2.0_mockup.html`](assets/plane_radar_2.0_mockup.html) in a browser.
 
@@ -40,6 +41,8 @@ A live **ADS-B aircraft radar** for the **Waveshare ESP32-S3-Touch-AMOLED-1.75**
 - **Top HUD**: WiFi status (amber if the data feed is failing), in-range aircraft count, NTP/RTC clock, **battery %** (charging bolt, red when low), and the date. The Stats view footer shows how to reach the config page (`capsuleradar.local` + IP).
 - **Battery aware** (AXP2101): shows charge level, warns when low, and slows the feed poll rate on battery to save power.
 - **Real-time clock** (PCF85063): keeps the time/date across power loss, so the clock is right even before/without WiFi; re-synced from NTP when online.
+- **Tap-to-track**: double-tap a selected aircraft to lock the scope on it — the tracked plane stays centered while everything else moves relative to it. Tap again to unlock.
+- **Clock face idle mode**: after the configurable idle timeout, a full-screen clock overlay appears with the current time, date, aircraft count and nearest aircraft info. Shake the device or tap to wake. Toggleable from the web config page.
 - **Smart brightness**: configurable idle auto-dim (no touch), and **face-down sleep** (QMI8658 IMU — flip it over to turn the screen off).
 - **GPS auto-location** (optional **-G** board variant): the Waveshare `-G` board has an onboard GPS (Quectel LC76G). Turn it on from the web page and the radar **sets its own center point automatically**, with an on-screen **satellite status icon** (amber while acquiring, green once it has a fix). Standard boards simply enter their location manually.
 - **Configuration web page** at `http://capsuleradar.local/` — center point (map picker), display range, theme, **time zone** (auto-detected from your browser), live brightness slider, sound, WiFi reset, and over-the-air firmware update. Settings persist in NVS.
@@ -47,14 +50,36 @@ A live **ADS-B aircraft radar** for the **Waveshare ESP32-S3-Touch-AMOLED-1.75**
 
 ## Hardware
 
-Waveshare **ESP32-S3-Touch-AMOLED-1.75**: ESP32-S3R8 (8 MB PSRAM, 16 MB flash), **CO5300** AMOLED over QSPI, **CST9217** touch, **QMI8658** IMU, **PCF85063** RTC, **AXP2101** PMIC, **ES8311** audio + speaker, microSD. All pins are in [`src/config.h`](src/config.h) (sourced from the board definition; no guessing).
+### Waveshare ESP32-S3-Touch-AMOLED-1.75
+
+ESP32-S3R8 (8 MB PSRAM, 16 MB flash), **CO5300** AMOLED over QSPI (466×466), **CST9217** touch, **QMI8658** IMU, **PCF85063** RTC, **AXP2101** PMIC, **ES8311** audio + speaker, microSD. All pins are in [`src/config.h`](src/config.h) (sourced from the board definition; no guessing).
+
+### Waveshare ESP32-S3-Touch-LCD-2.1
+
+ESP32-S3R8 (8 MB PSRAM, 16 MB flash), **ST7701** IPS LCD over 16-bit RGB parallel (480×480), **CST820** touch, **QMI8658** IMU (shake-to-wake). GPIO expansion via **TCA9554** I2C expander (backlight, LCD reset). No battery/PMIC, RTC, or audio codec — this board is USB-powered only. The RGB-LCD parallel interface requires careful coexistence with WiFi (GDMA + LCD ISRs must be in IRAM to survive WiFi cache-off events).
+
+**LCD 2.1 specific features:**
+- Custom **CST820** touch driver (different register map from CST9217)
+- **TCA9554** GPIO expander for backlight PWM and LCD reset
+- **ESP-IDF component mode** build with custom sdkconfig for IRAM-safe ISRs
+- **JPEG splash screen** (hardware-decoded)
+- **Coastline and airport overlays** reprojected during tracking
+- **Clock face idle overlay** with configurable enable/disable via web UI
 
 ## Build & flash (PlatformIO)
 
 ```bash
+# AMOLED 1.75" board
 pio run -e esp32-s3-amoled-175 -t upload     # build + flash over USB-C
+
+# LCD 2.1" board
+pio run -e esp32-s3-lcd-21 -t upload         # build + flash over USB-C
+
 pio device monitor -b 115200                  # serial log
 ```
+
+> **Note (LCD 2.1):** This target uses ESP-IDF component mode (`custom_sdkconfig` in platformio.ini) to place critical ISR handlers in IRAM. The build is longer (~5 min) than the AMOLED target due to full ESP-IDF component compilation.
+
 On first flash you may need to hold **BOOT** then tap **RESET**. After flashing, on first boot connect your phone to the **`CapsuleRadar-Setup`** WiFi and enter your home network — real aircraft appear within seconds.
 
 ## Flash from your browser (no toolchain)
@@ -82,7 +107,7 @@ Mouse = touch · `T` = switch theme · close the window to quit.
 
 ## Configuration
 
-Browse to `http://capsuleradar.local/` (or the device IP) on the same WiFi to set the **center lat/lon**, **display range**, **theme** and **brightness**, or to **reset WiFi**. Saving restarts the device to apply.
+Browse to `http://capsuleradar.local/` (or the device IP) on the same WiFi to set the **center lat/lon**, **display range**, **theme**, **brightness**, **clock idle mode** (on/off), **idle timeout**, and more — or to **reset WiFi**. Saving restarts the device to apply.
 
 ## Repo layout
 
@@ -90,13 +115,17 @@ Browse to `http://capsuleradar.local/` (or the device IP) on the same WiFi to se
 src/
   config.h           pins + tunables (Dénia, Spain by default)
   main.cpp           tasks, WiFi/NTP, web config, brightness/IMU glue
-  display.*          CO5300 (Arduino_GFX) + LVGL bring-up
+  display.*          CO5300 AMOLED (Arduino_GFX) + LVGL bring-up
+  display_lcd21.*    ST7701 RGB-LCD + TCA9554 backlight (LCD 2.1)
   radar_view.*       the radar scope, aircraft, themes
   ui.*               views (radar/list/stats) + detail card + HUD
-  touch_cst9217.*    capacitive touch driver
-  imu_qmi8658.*      accelerometer (face-down sleep)
-  battery.*          AXP2101 battery gauge
-  rtc_pcf85063.*     PCF85063 real-time clock
+  ui_clock.*         clock face idle-mode overlay
+  touch_cst9217.*    capacitive touch driver (AMOLED 1.75)
+  touch_cst820.*     capacitive touch driver (LCD 2.1)
+  tca9554.*          I2C GPIO expander helper (LCD 2.1)
+  imu_qmi8658.*      accelerometer (face-down sleep / shake-to-wake)
+  battery.*          AXP2101 battery gauge (AMOLED only)
+  rtc_pcf85063.*     PCF85063 real-time clock (AMOLED only)
   adsb_client.*      airplanes.live fetch + parse
   route*.* route.*   origin→destination lookup (adsbdb)
   sim_main.cpp       native SDL simulator (not flashed)
