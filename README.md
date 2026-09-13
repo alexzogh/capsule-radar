@@ -62,6 +62,21 @@ The Waveshare **ESP32-S3-Touch-AMOLED-1.43** is also supported in-tree. Same SoC
 
 Pin maps live in [`src/boards/`](src/boards/), one header per board, selected by a `-DBOARD_*` build flag. They are taken from the vendor board definition and then **confirmed on hardware** — never guessed. Shared tunables stay in [`src/config.h`](src/config.h).
 
+### Where to buy the board
+
+The 1.75″ board is in a **global stock squeeze** right now (even Waveshare lists it on backorder), so availability moves week to week. The official store is the reference; the Amazon links are what is actually in stock as of this writing.
+
+| Board | Waveshare official (ships worldwide) | Amazon US | Amazon ES / EU |
+|---|---|---|---|
+| **1.75″ standard** — no case; the one the printed enclosure needs | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm) (backorder) | no listing right now | sold out right now |
+| **1.75″ -G** — adds GPS (auto-location, heading-up) | same page, pick the **-G** option | [Amazon.com](https://www.amazon.com/dp/B0F8867487?tag=capsuleradar-20) | no listing right now |
+| **1.75″ -B** — the same board inside Waveshare's own case. Works, but you must open that case yourself and its shell is **not** the printed enclosure | same page, pick the **-B** option | — | [Amazon.es](https://www.amazon.es/dp/B0F7XTJ7JW?tag=capsuleradar-21) |
+| **1.43″** — the second supported board | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm), pick **without case** | — | — |
+
+> ⚠️ **Do not buy the “1.75C”** (`ESP32-S3-Touch-AMOLED-1.75C`, aluminum case): despite the name it is a **different board** and this firmware does not run on it.
+
+<sub>The Amazon links are affiliate links — as an Amazon Associate I earn from qualifying purchases, at no extra cost to you. The Waveshare links are plain links.</sub>
+
 ## Build & flash (PlatformIO)
 
 ```bash
