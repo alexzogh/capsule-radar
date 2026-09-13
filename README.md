@@ -66,12 +66,12 @@ Pin maps live in [`src/boards/`](src/boards/), one header per board, selected by
 
 The 1.75″ board is in a **global stock squeeze** right now (even Waveshare lists it on backorder), so availability moves week to week. The official store is the reference; the Amazon links are what is actually in stock as of this writing.
 
-| Board | Waveshare official (ships worldwide) | Amazon US | Amazon ES / EU |
-|---|---|---|---|
-| **1.75″ standard** — no case; the one the printed enclosure needs | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm) (backorder) | no listing right now | sold out right now |
-| **1.75″ -G** — adds GPS (auto-location, heading-up) | same page, pick the **-G** option | [official listing](https://www.amazon.com/dp/B0F7XWWMJW?tag=capsuleradar-20) (restocking) · [third-party, in stock](https://www.amazon.com/dp/B0F8867487?tag=capsuleradar-20) | [official listing](https://www.amazon.es/dp/B0F7XWWMJW?tag=capsuleradar-21) (restocking) |
-| **1.75″ -B** — the same board inside Waveshare's own case. Works, but you must open that case yourself and its shell is **not** the printed enclosure | same page, pick the **-B** option | — | [Amazon.es](https://www.amazon.es/dp/B0F7XTJ7JW?tag=capsuleradar-21) |
-| **1.43″** — the second supported board | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm), pick **without case** | — | — |
+| Board | Waveshare official (ships worldwide) | Amazon (affiliate links) |
+|---|---|---|
+| **1.75″ standard** — no case; the one the printed enclosure needs | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm) (backorder) | sold out on every marketplace right now |
+| **1.75″ -G** — adds GPS (auto-location, heading-up) | same page, pick the **-G** option | 🇺🇸 [.com](https://www.amazon.com/dp/B0F7XWWMJW?tag=capsuleradar-20) · 🇪🇸 [.es](https://www.amazon.es/dp/B0F7XWWMJW?tag=capsuleradar-21) · 🇩🇪 [.de](https://www.amazon.de/dp/B0F7XWWMJW?tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/dp/B0F7XWWMJW?tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/dp/B0F7XWWMJW?tag=capsulerada08-21) — official Waveshare listing, restocking · 🇺🇸 [third-party, in stock](https://www.amazon.com/dp/B0F8867487?tag=capsuleradar-20) |
+| **1.75″ -B** — the same board inside Waveshare's own case. Works, but you must open that case yourself and its shell is **not** the printed enclosure | same page, pick the **-B** option | 🇪🇸 [.es](https://www.amazon.es/dp/B0F7XTJ7JW?tag=capsuleradar-21) |
+| **1.43″** — the second supported board | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm), pick **without case** | — |
 
 > ⚠️ **Do not buy the “1.75C”** (`ESP32-S3-Touch-AMOLED-1.75C`, aluminum case): despite the name it is a **different board** and this firmware does not run on it.
 
