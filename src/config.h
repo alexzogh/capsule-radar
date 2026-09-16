@@ -89,6 +89,8 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #if defined(BOARD_LCD21)
 // ---------------------------------------------------------------------------
 //  Waveshare ESP32-S3-Touch-LCD-2.1 : ST7701 480x480 IPS, 16-bit RGB parallel.
+#define BOARD_NAME          "ESP32-S3-Touch-LCD-2.1"
+#define BOARD_PIO_ENV       "esp32-s3-lcd-21"
 //  Pins/timings are from Waveshare's own Arduino demo (LVGL_Arduino):
 //    files.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.1/ESP32-S3-Touch-LCD-2.1-Code.zip
 //  The verbose RGB data-bus pin table + ST7701 init sequence live in display_st7701.cpp
