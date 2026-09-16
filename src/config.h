@@ -148,6 +148,24 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #  include "boards/board_amoled_175.h"
 #endif
 
+// ---------- Screen geometry (board-specific where panels differ) ----------
+#if !defined(SCREEN_W)
+// AMOLED boards: CO5300 466x466.
+#define SCREEN_W            466
+#define SCREEN_H            466
+#define SCREEN_CX           233
+#define SCREEN_CY           233
+#define RADAR_R_OUTER_PX    218            // outer ring radius in pixels
+#endif
+
+// ---------- Display brightness / idle ----------
+#if !defined(BRIGHTNESS_DEFAULT)
+#define BRIGHTNESS_DEFAULT  200            // 0..255, panel brightness via cmd 0x51
+#endif
+#define BRIGHTNESS_IDLE     25             // dimmed after no touch for IDLE_DIM_MS
+#define IDLE_DIM_MS         20000          // dim the screen after this long without a touch
+#define TZ_STR              "CET-1CEST,M3.5.0,M10.5.0/3"  // POSIX TZ (Spain) for local time/date
+
 // Safety net: catches a board header that still has placeholder pins in it.
 #if (PIN_LCD_SCLK < 0) || (PIN_I2C_SDA < 0)
 #  error "board header: QSPI/I2C pins are placeholders (-1). Fill in the real values."
