@@ -46,9 +46,19 @@ jobs:
               find "$HOME/.platformio/packages" -name '*.bin' 2>/dev/null | head -20
               return 1
             fi
+            # IDF component mode puts bootloader under a subdirectory
+            local bootloader="$b/bootloader.bin"
+            if [ ! -f "$bootloader" ]; then
+              bootloader="$(find "$b" -name bootloader.bin 2>/dev/null | head -1)"
+            fi
+            if [ -z "$bootloader" ] || [ ! -f "$bootloader" ]; then
+              echo "::error::bootloader.bin not found for $env"
+              find "$b" -name '*.bin' 2>/dev/null | head -20
+              return 1
+            fi
             python -m esptool --chip esp32s3 merge_bin -o "CapsuleRadar-esp32s3$sfx.bin" \
               --flash_mode dio --flash_freq 80m --flash_size 16MB \
-              0x0     "$b/bootloader.bin" \
+              0x0     "$bootloader" \
               0x8000  "$b/partitions.bin" \
               0xe000  "$boot_app0" \
               0x10000 "$b/firmware.bin"

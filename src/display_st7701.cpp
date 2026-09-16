@@ -327,13 +327,13 @@ void setBrightness(uint8_t v) {
     ledcWrite(PIN_LCD_BL, (uint32_t)v * maxDuty / 255u);
 }
 
-void setRotation(uint8_t quarters) {
-    s_rot = (uint8_t)(quarters & 3);
+void setRotation(uint16_t degrees) {
+    s_rot = (uint8_t)((degrees / 90) & 3);
     if (!s_ready) return;
     lv_obj_t *scr = lv_scr_act();
     if (scr) lv_obj_invalidate(scr);
 }
-uint8_t rotation() { return s_rot; }
+uint16_t rotation() { return (uint16_t)(s_rot * 90); }
 
 uint32_t inactiveMs() { return s_ready ? lv_disp_get_inactive_time(NULL) : 0; }
 
