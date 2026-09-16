@@ -14,8 +14,10 @@
 // ±2g full scale -> 16384 LSB/g.
 #define FACEDOWN_THRESHOLD (9000)   // ~0.55 g past zero on the side opposite the resting one
 
-static uint8_t s_addr = 0x6B;
-static bool    s_ok   = false;
+static uint8_t s_addr    = 0x6B;
+static bool    s_ok      = false;
+static int32_t s_ref     = 0;      // slow baseline of the resting az (see imu_facedown)
+static bool    s_haveRef = false;
 
 static bool wr(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(s_addr);
@@ -102,9 +104,10 @@ int imu_facedown() {
     // board sits in the case, and it isn't the same on every unit). Track a slow baseline
     // of the *resting* az and call it face-down when gravity swings to the far OPPOSITE
     // side — i.e. the device was flipped over. Works whatever the sensor's sign.
-    static int32_t ref = 0; static bool haveRef = false;
-    if (!haveRef) { ref = az; haveRef = true; }
-    const bool down = (ref < 0) ? (az > FACEDOWN_THRESHOLD) : (az < -FACEDOWN_THRESHOLD);
-    if (!down) ref += (az - ref) >> 4;   // EMA toward the current (not-face-down) orientation
+    if (!s_haveRef) { s_ref = az; s_haveRef = true; }
+    const bool down = (s_ref < 0) ? (az > FACEDOWN_THRESHOLD) : (az < -FACEDOWN_THRESHOLD);
+    if (!down) s_ref += (az - s_ref) >> 4;   // EMA toward the current (not-face-down) orientation
     return down ? 1 : 0;
 }
+
+void imu_rebaseline() { s_haveRef = false; }

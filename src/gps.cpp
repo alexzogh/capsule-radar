@@ -129,3 +129,7 @@ bool gps_location(double *lat, double *lon) {
 int gps_satellites() {
     return s_gps.satellites.isValid() ? (int)s_gps.satellites.value() : 0;
 }
+
+float gps_altitude_m() {
+    return s_gps.altitude.isValid() ? (float)s_gps.altitude.meters() : NAN;
+}

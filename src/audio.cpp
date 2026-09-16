@@ -7,7 +7,13 @@
 // that table is board-specific, the rest is independent.
 #include "audio.h"
 #include "config.h"
+
 #include <Arduino.h>
+
+// Boards without an ES8311 (e.g. the 1.43) compile to no-ops. This is not just
+// dead weight: that board reuses GPIO 9/10 -- the 1.75's I2S BCLK/DIN -- as the
+// panel's QSPI CS and SCLK, so configuring I2S here would break the display.
+#if BOARD_HAS_AUDIO
 #include <Wire.h>
 #include "driver/i2s.h"
 #include "esp_heap_caps.h"
@@ -151,7 +157,12 @@ static void play_cue(int cue) {
     int16_t *buf = s_buf;
     const float amp = (s_vol / 100.0f) * 17000.0f;
     digitalWrite(PIN_AUDIO_PA, HIGH);              // enable speaker amp
-    delay(8);                                      // let the amp power up
+    // The NS4150B amp needs FAR more than 8 ms to stabilise after power-off: with the old
+    // delay(8) the short pings ended before the speaker was audible on some units (only the
+    // long self-test tone could be heard, or nothing at all — issue #12). Lesson learned on
+    // the same board in TamaPoke. Pings are rare, so a generous settle beats keeping the amp
+    // always-on (which risks idle hiss and burns battery).
+    delay(150);
     size_t bw;
     if (cue == 2) {                                // self-test: ~2 s continuous tone, PA held
         size_t ns = gen_beep(buf, S_BUF_LEN, 1000.0f, 480, amp);
@@ -226,3 +237,14 @@ void audio_selftest() {   // ~2 s continuous tone, ignores mute, PA held on
     s_cue = 2;
     if (s_sem) xSemaphoreGive(s_sem);
 }
+
+#else   // !BOARD_HAS_AUDIO
+
+bool audio_begin()              { Serial.println("[audio] no codec on this board"); return false; }
+bool audio_present()            { return false; }
+void audio_set_volume(int)      {}
+void audio_set_muted(bool)      {}
+void audio_play(AudioCue)       {}
+void audio_selftest()           {}
+
+#endif  // BOARD_HAS_AUDIO

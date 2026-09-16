@@ -7,10 +7,10 @@
 // The board macro comes from platformio.ini (build_flags -D...). Everything above the
 // board split is common; hardware-specific pins/geometry live in the #if blocks below.
 
-#define FW_VERSION "1.3.20"   // shown on the web config page + Stats screen; bump on release
+#define FW_VERSION "1.4.0"   // shown on the web config page + Stats screen; bump on release
 
 // Default to the original AMOLED board if no board was selected by the build.
-#if !defined(BOARD_LCD21) && !defined(BOARD_AMOLED175)
+#if !defined(BOARD_LCD21) && !defined(BOARD_AMOLED175) && !defined(BOARD_AMOLED_143)
 #  define BOARD_AMOLED175
 #endif
 
@@ -22,9 +22,9 @@
 // ---------- Radar ----------
 #define RANGE_KM_DEFAULT    30.0f          // display range (outer ring). Query is wider, see below.
 // Feed query radius = display range × MULT, clamped to [MIN, MAX]. Querying a bit wider than
-// the display shows off-range traffic as edge arrows. The floor MUST stay small: a large floor
-// (this was 50 km) makes small display ranges still pull a huge aircraft list in busy airspace,
-// which times out the poll and pressures the TLS heap. Keep it tight so shrinking the range works.
+// the display shows off-range traffic as edge arrows. The floor MUST stay small: the old 50 km
+// floor made small display ranges still pull a huge aircraft list in busy airspace, which timed
+// out the poll (feed permanently amber near big hubs). Fix contributed by @alexzogh (STLWarehouse).
 #define ADSB_QUERY_MULT     1.4f
 #define ADSB_QUERY_MIN_KM   12.0f
 #define ADSB_QUERY_MAX_KM   150.0f
@@ -40,28 +40,52 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 #  define FEED_STUCK_REBOOT_MS 180000      // 3 min (AMOLED, original behaviour)
 #endif
 #define MOTION_INTERP       1              // 1 = glyphs glide between polls; 0 = snap to new pos
-#define AC_STALE_MS         15000          // drop aircraft not refreshed in this long
+#define AC_STALE_MS         15000          // keep the last contacts through brief empty feed responses
+
+// ---------- Weather forecast (Open-Meteo, no API key) ----------
+#define WEATHER_REFRESH_MS  1800000UL      // 30 minutes; forecast data changes slowly
+#define WX_RADAR_REFRESH_MS 300000UL       // RainViewer frames update about every 5 minutes
+#define CLOUD_IMAGE_REFRESH_MS 600000UL    // EUMETSAT MTG cloud imagery; cache for 10 minutes
 
 // ---------- ADS-B API (free, non-commercial) ----------
+// Providers are tried in this order; each is paced independently (see AdsbClient).
+// All three return the same readsb shape (an "ac" array), but NOT the same URL path,
+// so each carries its own template in the provider table in adsb_client.cpp.
 #define ADSB_PRIMARY_HOST   "api.airplanes.live"   // GET /v2/point/{lat}/{lon}/{radius_nm}
-#define ADSB_FALLBACK_HOST  "api.adsb.lol"          // same readsb format
-#define ADSB_USER_AGENT     "CapsuleRadar/1.0 (ESP32-S3 hobby; +https://github.com/socquique/capsule-radar)"
+                                                    //   now requires prior approval by email
+#define ADSB_OPENDATA_HOST  "opendata.adsb.fi"     // GET /api/v3/lat/{lat}/lon/{lon}/dist/{nm}
+                                                    //   documented 1 req/s; personal use only,
+                                                    //   attribution required (see docs/DATA_SOURCE.md)
+#define ADSB_FALLBACK_HOST  "api.adsb.lol"          // same readsb format; limits are dynamic
+#define ADSB_PROVIDER_COUNT 3
+// Sent with setUserAgent(), never addHeader() — see the note in docs/DATA_SOURCE.md.
+// Carries FW_VERSION: now that the header actually goes out, and adsb.lol checks it for
+// valid contact info, a provider should be able to tell which build is talking to them.
+#define ADSB_USER_AGENT     "CapsuleRadar/" FW_VERSION " (ESP32-S3 hobby; +https://github.com/socquique/capsule-radar)"
 #define ADSB_HTTPS_INSECURE 1               // 1 = setInsecure() (hobby). 0 = use pinned root CA.
 #define ADSB_MAX_AIRCRAFT   60              // hard cap parsed per poll (protect RAM in busy areas)
+// How long to stop asking a provider that refused us. 403 is a policy refusal (needs
+// approval, or a User-Agent they reject) and will not clear in seconds; 429 just means
+// we were too fast. Without these, a permanently-403 provider is retried every poll,
+// which doubles the request rate onto the surviving provider and trips ITS rate limit.
+#define ADSB_COOLDOWN_403_MS  900000UL      // 15 min park after a policy refusal
+#define ADSB_SPACING_STEP_MS    4000UL      // first extra gap imposed after a 429
+#define ADSB_SPACING_MAX_MS    60000UL      // never space a provider out further than this
+#define ADSB_SPACING_EASE_OKS       3       // successes needed before easing the gap back down
+#define ADSB_FEED_STALE_MS     60000UL      // no successful fetch for this long -> HUD warning
 
 // ---------- Debug ----------
 #define DEBUG_MEM           0               // 1 = print a [mem] heap/fps line every 5s on serial
 
-// ---------- Common display / UX ----------
-#define LV_COLOR_DEPTH_BITS 16
-#define BRIGHTNESS_DEFAULT  200            // 0..255 (mapped to the panel's brightness mechanism)
-#define BRIGHTNESS_IDLE     25             // dimmed after no touch for IDLE_DIM_MS
-#define IDLE_DIM_MS         20000          // dim the screen after this long without a touch
-#define TZ_STR              "CET-1CEST,M3.5.0,M10.5.0/3"  // POSIX TZ (Spain) for local time/date
-
-// ============================================================================
-//  Board-specific hardware
-// ============================================================================
+// ---------- Board ----------
+// The pin map, panel gaps, touch driver and which peripherals exist all live in a
+// per-board header (or inline, for the LCD 2.1). Select one with a build flag in
+// platformio.ini; the 1.75 is the default so an unflagged build behaves exactly as before.
+//   -DBOARD_LCD21       -> Waveshare ESP32-S3-Touch-LCD-2.1
+//   -DBOARD_AMOLED_143  -> Waveshare ESP32-S3-Touch-AMOLED-1.43
+//   (none)              -> Waveshare ESP32-S3-Touch-AMOLED-1.75  (reference board)
+// Never guess pins for a new board: take them from the vendor demo or the Arduino
+// core board variant, then confirm them on hardware before committing.
 #if defined(BOARD_LCD21)
 // ---------------------------------------------------------------------------
 //  Waveshare ESP32-S3-Touch-LCD-2.1 : ST7701 480x480 IPS, 16-bit RGB parallel.
@@ -118,60 +142,13 @@ static const float RANGE_STEPS_KM[] = {10.0f, 20.0f, 30.0f, 50.0f, 100.0f};
 
 #define PIN_BOOT_BUTTON     0              // BOOT button
 
-#else  // ---------------------- BOARD_AMOLED175 (original) ----------------------
-// ---------------------------------------------------------------------------
-//  Waveshare ESP32-S3-Touch-AMOLED-1.75 : CO5300 466x466 AMOLED, QSPI, CST9217 touch.
-// ---------------------------------------------------------------------------
-
-// ---------- Screen (CO5300 AMOLED) ----------
-#define SCREEN_W            466
-#define SCREEN_H            466
-#define SCREEN_CX           233
-#define SCREEN_CY           233
-#define RADAR_R_OUTER_PX    218            // outer ring radius in pixels
-#define LCD_COL_OFFSET      6              // CO5300 column (x) gap on this panel (esp_lcd set_gap 0x06)
-#define LCD_ROW_OFFSET      0              // no row (y) gap
-#define LCD_QSPI_HZ         80000000       // CO5300 QSPI clock (vendor uses 40 MHz; 80 = faster, verify no artifacts)
-
-// ---------- Pin map ----------
-// VERIFIED (ESPHome def, cross-checked against the Waveshare board definition in
-// xiaozhi-esp32 and a working Arduino_GFX port for this exact panel):
-#define PIN_LCD_CS          12
-#define PIN_LCD_RST         39
-#define PIN_TP_INT          11
-#define PIN_TP_RST          40
-#define TP_MIRROR_X         true
-#define TP_MIRROR_Y         true
-
-// CONFIRMED — CO5300 QSPI databus (LCD_CS=12, LCD_RST=39 above match too):
-#define PIN_LCD_SCLK        38             // QSPI PCLK
-#define PIN_LCD_D0          4
-#define PIN_LCD_D1          5
-#define PIN_LCD_D2          6
-#define PIN_LCD_D3          7
-
-// CONFIRMED — shared I2C bus (touch + IMU + RTC + PMIC + audio codec):
-#define PIN_I2C_SDA         15
-#define PIN_I2C_SCL         14
-
-// CONFIRMED — ES8311 codec over I2S (M4 alert ping). MCLK/DIN/PA included for completeness:
-#define PIN_I2S_MCLK        42
-#define PIN_I2S_BCLK        9
-#define PIN_I2S_LRCLK       45             // a.k.a. WS
-#define PIN_I2S_DOUT        8              // ESP32 -> codec (speaker)
-#define PIN_I2S_DIN         10             // codec -> ESP32 (mics)
-#define PIN_AUDIO_PA        46             // speaker amp enable
-#define PIN_BOOT_BUTTON     0              // BOOT button (held on boot = captive portal, later)
-
-// I2C addresses:
-#define I2C_ADDR_TOUCH      0x5A           // CST9217 (corrected from vendor driver; was 0x15)
-#define I2C_ADDR_IMU        0x6B
-#define I2C_ADDR_RTC        0x51
-#define I2C_ADDR_PMIC       0x34
-
-// Safety net: should never fire now that pins are filled in. Keeps future edits honest.
-#if (PIN_LCD_SCLK < 0) || (PIN_I2C_SDA < 0)
-#  error "config.h: QSPI/I2C pins are back to placeholders (-1). Restore the real values."
+#elif defined(BOARD_AMOLED_143)
+#  include "boards/board_amoled_143.h"
+#else
+#  include "boards/board_amoled_175.h"
 #endif
 
-#endif  // board select
+// Safety net: catches a board header that still has placeholder pins in it.
+#if (PIN_LCD_SCLK < 0) || (PIN_I2C_SDA < 0)
+#  error "board header: QSPI/I2C pins are placeholders (-1). Fill in the real values."
+#endif

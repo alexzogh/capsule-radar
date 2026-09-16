@@ -7,10 +7,17 @@
 #include "aircraft.h"
 #include "geo.h"
 #include "adsb_client.h"
+#include "snapshot_gate.h"
 #include "route.h"
 #include "route_client.h"
 #include "photo.h"
 #include "photo_client.h"
+#include "weather.h"
+#include "weather_client.h"
+#include "wx_radar.h"
+#include "wx_radar_client.h"
+#include "cloud_image.h"
+#include "cloud_image_client.h"
 #include "radar_view.h"
 #include "ui.h"
 #include "ui_clock.h"                // clock face idle-mode overlay
@@ -46,17 +53,22 @@ static bool                  g_muted  = false;                       // mute ale
 static int                   g_alertMode = 2;                        // 0=off 1=emergencies 2=new+emergencies (web/NVS)
 static float                 g_proximityKm = 0.0f;                   // proximity alert radius, km (0=off) (web/NVS)
 static uint32_t              g_idleDimMs = IDLE_DIM_MS;              // dim after this idle time (0 = never)
+static bool                  g_fdSleep = true;                       // face-down sleep (screen off) on/off (web/NVS)
 static bool                  g_showSweep = true;                     // rotating sweep line on/off (web/NVS)
 static int                   g_units = 0;                            // 0=Aviation 1=Metric 2=Imperial (web/NVS)
 static bool                  g_showAirports = true;                  // airport markers on/off (web/NVS)
 static bool                  g_hideGround   = false;                 // skip on-ground aircraft in the feed (web/NVS)
 static int                   g_minAltFt     = 0;                     // only show aircraft above this altitude, ft (0 = off) (web/NVS)
+static int                   g_maxAltFt     = 0;                     // only show aircraft below this altitude, ft (0 = off) (web/NVS)
+static int                   g_lastView     = 0;                     // last active view (0 radar/1 list/2 stats/3 weather) (NVS)
+static bool                  g_bootedIntoPortal = false;             // saved WiFi absent at boot (e.g. car hotspot not up yet)
 static bool                  g_milOnly      = false;                 // only show military-flagged aircraft (web/NVS)
-static int                   g_rotation = 0;                         // display rotation 0/1/2/3 = 0/90/180/270 (web/NVS)
+static int                   g_rotation = 0;                         // clockwise display rotation, 0..359° (web/NVS)
 static bool                  g_useGps = false;                       // auto-set home from the LC76G GPS (-G variant) (web/NVS)
 static int                   g_trailLen = 2;                         // aircraft trails 0=off 1=short 2=med 3=long (web/NVS)
 static int                   g_maxAc = 20;                           // max aircraft drawn on the scope (web/NVS)
 static bool                  g_clockEnabled = true;                  // show clock face on idle (web/NVS)
+static bool                  g_bigText = false;                      // accessibility: large fonts (web/NVS, applied at boot)
 static volatile bool         g_onBattery = false;                    // discharging (set on core 1, read on core 0)
 static bool                  g_rtcSynced = false;                    // RTC written from NTP this session?
 static std::vector<Aircraft> g_snap;                                 // last snapshot (instant re-render on zoom)
@@ -66,6 +78,9 @@ static volatile bool         g_feedOk = true;                        // ADS-B fe
 static volatile uint32_t     g_lastFeedOkMs = 0;                     // millis() of the last good poll (HUD staleness)
 static volatile uint32_t     g_rebootAtMs = 0;                       // !=0: reboot when millis() reaches it (clean start after WiFi config)
 static String                g_tz = TZ_STR;                          // POSIX timezone (web-configurable, NVS); applied via configTzTime
+static volatile bool         g_weatherDirty = false;
+static volatile bool         g_wxRadarDirty = false;
+static volatile bool         g_cloudImageDirty = false;
 
 // Web-selectable time zones (label + POSIX TZ). The <option> value is the index; the save
 // handler maps it back to the POSIX string stored in NVS and used by configTzTime at boot.
@@ -96,8 +111,13 @@ static const int TZOPTS_N = sizeof(TZOPTS) / sizeof(TZOPTS[0]);
 // ---- networking task (core 0): fetch + parse, never touches the display ----
 static void adsb_task(void*) {
     std::vector<Aircraft> fresh;
+    AircraftSnapshotGate snapshotGate;
+    bool retainingEmptySnapshot = false;
     bool wasConnected = false;
     uint32_t lastPoll = 0;
+    uint32_t nextWeatherAt = UINT32_MAX;       // armed five seconds after WiFi connects
+    uint32_t nextWxRadarAt = UINT32_MAX;
+    uint32_t nextCloudImageAt = UINT32_MAX;
     uint32_t lastFeedOk = millis();          // self-heal: time of last good (or no-WiFi) poll
     int      failCount = 0;                  // consecutive poll failures -> exponential backoff
     for (;;) {
@@ -109,11 +129,20 @@ static void adsb_task(void*) {
             Serial.printf("[adsb] WiFi up, IP %s\n", WiFi.localIP().toString().c_str());
             configTzTime(g_tz.c_str(), "pool.ntp.org", "time.nist.gov");  // local time (web-configurable TZ)
             Serial.println("[web] config: http://capsuleradar.local/  (or the IP above)");
+            nextWeatherAt = millis() + 5000UL; // let the first ADS-B poll complete before weather TLS
+            nextCloudImageAt = millis() + 15000UL;
+            nextWxRadarAt = millis() + 12000UL;
             // mDNS + OTA are started on core 1 (loop) to keep all mDNS use on one core
         }
         wasConnected = conn;
         // self-heal: a long feed outage while WiFi is up usually means the internal heap
         // fragmented and the TLS handshake can't allocate -> reboot to recover (settings persist).
+        // A provider that answers "403, not for you" is NOT that failure, and neither is a poll
+        // we deliberately paced: the stack is fine either way. Count any completed HTTP exchange
+        // as alive, or a feed that every provider refuses reboots the device every three
+        // minutes — and every boot asks all three of them again.
+        const uint32_t lastHttpMs = g_adsb.lastResponseMs();
+        if (lastHttpMs && (int32_t)(lastHttpMs - lastFeedOk) > 0) lastFeedOk = lastHttpMs;
         if (!conn) lastFeedOk = millis();
         else if (FEED_STUCK_REBOOT_MS > 0 && millis() - lastFeedOk > (uint32_t)FEED_STUCK_REBOOT_MS) {
             Serial.printf("[adsb] feed stuck >%lus with WiFi up -> restarting to recover\n",
@@ -142,22 +171,79 @@ static void adsb_task(void*) {
             }
             if (lastPoll == 0 || nowMs - lastPoll >= pollInterval) {  // aircraft feed
                 lastPoll = nowMs;
-                // poll() flips to the alternate host on failure, so consecutive polls already
-                // alternate hosts; a single transient miss is absorbed by the failCount window.
+                // poll() tries the fallback provider after a primary failure; keep the HUD
+                // healthy through isolated misses and warn only after a sustained outage.
                 if (g_adsb.poll(fresh)) {
-                    Serial.printf("[adsb] fetched %u aircraft\n", (unsigned)fresh.size());
+                    Serial.printf("[adsb] fetched %u aircraft from %s\n", (unsigned)fresh.size(), g_adsb.lastHost());
                     failCount = 0;
                     g_feedOk = true;
-                    lastFeedOk = nowMs;
-                    g_lastFeedOkMs = nowMs;          // HUD: mark data as fresh
-                    if (xSemaphoreTake(g_ac_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                        g_aircraft.swap(fresh);   // O(1) handoff: no per-Aircraft String copies under the lock
-                        g_acDirty = true;
-                        xSemaphoreGive(g_ac_mutex);
+                    const uint32_t receivedMs = millis();
+                    lastFeedOk = receivedMs;
+                    g_lastFeedOkMs = receivedMs;      // HUD: mark data as fresh
+
+                    const bool publish = snapshotGate.shouldPublish(
+                        !fresh.empty(), receivedMs, AC_STALE_MS);
+                    if (!publish) {
+                        if (!retainingEmptySnapshot) {
+                            Serial.printf("[adsb] empty snapshot; retaining contacts for %u ms\n",
+                                          (unsigned)AC_STALE_MS);
+                            retainingEmptySnapshot = true;
+                        }
+                    } else {
+                        if (retainingEmptySnapshot && fresh.empty())
+                            Serial.println("[adsb] empty snapshot persisted; clearing stale contacts");
+                        retainingEmptySnapshot = false;
+                        if (xSemaphoreTake(g_ac_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                            g_aircraft.swap(fresh);   // O(1) handoff: no per-Aircraft String copies under the lock
+                            g_acDirty = true;
+                            xSemaphoreGive(g_ac_mutex);
+                        }
                     }
+                } else if (g_adsb.lastPollSkipped()) {
+                    // Every provider is parked or inside its spacing window: we chose not to
+                    // ask. Logging this each tick would bury the real errors, and counting it
+                    // would show an outage warning for our own politeness. Prolonged silence
+                    // still trips the warning, via the time check rather than a fail count.
+                    if ((int32_t)(nowMs - g_adsb.lastOkMs()) > (int32_t)ADSB_FEED_STALE_MS)
+                        g_feedOk = false;
                 } else {
                     Serial.println("[adsb] poll failed");
                     if (++failCount >= 5) g_feedOk = false;   // sustained outage -> HUD warning
+                }
+            }
+            // Forecasts change slowly. Fetch only after the live ADS-B poll has had priority.
+            if ((int32_t)(nowMs - nextWeatherAt) >= 0) {
+                Serial.printf("[weather] fetching %.5f, %.5f...\n",
+                              g_settings.homeLat, g_settings.homeLon);
+                WeatherSnapshot forecast;
+                if (weather_fetch(g_settings.homeLat, g_settings.homeLon, forecast)) {
+                    weather_store(forecast);
+                    g_weatherDirty = true;
+                    nextWeatherAt = millis() + WEATHER_REFRESH_MS;
+                    Serial.println("[weather] forecast updated");
+                } else {
+                    nextWeatherAt = millis() + 60000UL;
+                    Serial.println("[weather] fetch failed; retrying in 60s");
+                }
+            }
+            if ((int32_t)(nowMs - nextWxRadarAt) >= 0) {
+                Serial.println("[wxradar] fetching latest frame...");
+                if (wx_radar_fetch(g_settings.homeLat, g_settings.homeLon)) {
+                    g_wxRadarDirty = true;
+                    nextWxRadarAt = millis() + WX_RADAR_REFRESH_MS;
+                } else {
+                    nextWxRadarAt = millis() + 60000UL;
+                    Serial.println("[wxradar] fetch failed; retrying in 60s");
+                }
+            }
+            if ((int32_t)(nowMs - nextCloudImageAt) >= 0) {
+                Serial.println("[clouds] fetching EUMETSAT frame...");
+                if (cloud_image_fetch(g_settings.homeLat, g_settings.homeLon)) {
+                    g_cloudImageDirty = true;
+                    nextCloudImageAt = millis() + CLOUD_IMAGE_REFRESH_MS;
+                } else {
+                    nextCloudImageAt = millis() + 60000UL;
+                    Serial.println("[clouds] fetch failed; retrying in 60s");
                 }
             }
             // Then the on-demand lookups for the selected aircraft. Their timeouts are kept
@@ -191,7 +277,8 @@ static void loadSettings() {
     g_settings.homeLat = p.getDouble("homeLat", HOME_LAT_DEFAULT);
     g_settings.homeLon = p.getDouble("homeLon", HOME_LON_DEFAULT);
     g_settings.rangeKm = p.getFloat("rangeKm", RANGE_KM_DEFAULT);
-    g_brightnessDay    = p.getInt("bright", BRIGHTNESS_DEFAULT);
+    // floor of 5: a stored 0 would boot with the panel dark forever, looking like a dead board
+    g_brightnessDay    = constrain(p.getInt("bright", BRIGHTNESS_DEFAULT), 5, 255);
     g_volume           = p.getInt("vol", 60);
     g_muted            = p.getBool("mute", false);
     g_alertMode        = p.getInt("alertmode", 2);
@@ -200,10 +287,16 @@ static void loadSettings() {
     g_trailLen         = p.getInt("traillen", 2);
     g_maxAc            = p.getInt("maxac", 20);
     g_idleDimMs        = p.getUInt("idledim", IDLE_DIM_MS);
+    g_fdSleep          = p.getBool("fdsleep", true);
     g_units            = p.getInt("units", 0);
     g_tz               = p.getString("tz", TZ_STR);
     g_clockEnabled     = p.getBool("clock", true);
+    g_bigText          = p.getBool("bigtext", false);
     p.end();
+    // fonts are baked into the widgets at creation time, so the large-text flag must be
+    // in place before display::begin() builds the UI (loadSettings runs first in setup)
+    ui_set_large_text(g_bigText);
+    radar::setLargeText(g_bigText);
 }
 
 // Audio alerts. g_alertMode: 0 = off, 1 = emergencies only, 2 = new aircraft + emergencies.
@@ -242,6 +335,15 @@ static void checkAudioEvents() {
     first = false;
 }
 
+// Feed query radius: wider than the display range (so off-range traffic shows as edge
+// arrows) AND wide enough to cover the proximity-alert circle (else an alert radius larger
+// than the query would never fire), clamped to keep busy-airspace downloads bounded.
+static float queryRadiusKm() {
+    float km = g_settings.rangeKm * ADSB_QUERY_MULT;
+    if (g_proximityKm > 0.0f && g_proximityKm * 1.2f > km) km = g_proximityKm * 1.2f;
+    return constrain(km, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
+}
+
 // Double-tap zoom: change the display range, persist it, and ask adsb_task to
 // re-query at a matching radius (safely, on its own core). Re-render immediately.
 static void onRangeChange(float km) {
@@ -250,7 +352,7 @@ static void onRangeChange(float km) {
     p.begin("capsuleradar", false);
     p.putFloat("rangeKm", km);
     p.end();
-    g_requeryKm = constrain(km * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
+    g_requeryKm = queryRadiusKm();
     g_requery = true;
     radar::update(g_snap, g_settings);   // instant visual zoom from the last snapshot
     ui_set_range_km(km);
@@ -337,13 +439,6 @@ static void handleRoot() {
         snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", i, i == g_units ? " selected" : "", unames[i]);
         uopts += o;
     }
-    const char *rnames[] = {"0\xc2\xb0 (default)", "90\xc2\xb0", "180\xc2\xb0", "270\xc2\xb0"};
-    String rotopts;
-    for (int i = 0; i < 4; ++i) {
-        char o[64];
-        snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", i, i == g_rotation ? " selected" : "", rnames[i]);
-        rotopts += o;
-    }
     const char *tlnames[] = {"Off", "Short", "Medium", "Long"};
     String tlopts;
     for (int i = 0; i < 4; ++i) {
@@ -368,6 +463,17 @@ static void handleRoot() {
         char o[96];
         snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", mv.ft, mv.ft == g_minAltFt ? " selected" : "", mv.lbl);
         maopts += o;
+    }
+    // maximum-altitude filter (heli / low-traffic spotting): same steps, "below" phrasing
+    const struct { int ft; const char *lbl; } mbvals[] = {
+        {0, "Off"}, {5000, "&lt; 5,000 ft (1.5 km)"}, {10000, "&lt; 10,000 ft (3 km)"},
+        {20000, "&lt; 20,000 ft (6 km)"},
+    };
+    String mbopts;
+    for (auto &mv : mbvals) {
+        char o[96];
+        snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", mv.ft, mv.ft == g_maxAltFt ? " selected" : "", mv.lbl);
+        mbopts += o;
     }
     const char *anames[] = {"Off", "Emergencies only", "New aircraft + emergencies"};
     String aopts;
@@ -451,14 +557,18 @@ static void handleRoot() {
         "<label>Brightness</label>"
         "<input type=range min=5 max=255 value='%d' oninput='b(this.value,0)' onchange='b(this.value,1)'>"
         "<label>Dim screen after</label><select onchange='d(this.value)'>%s</select>"
+        "<label><input type=checkbox class=ck %s onchange='fd(this.checked)'>Screen off when placed face-down</label>"
         "<label><input type=checkbox class=ck %s onchange='sw(this.checked)'>Show radar sweep</label>"
         "<label><input type=checkbox class=ck %s onchange='ap(this.checked)'>Show airports</label>"
         "<label><input type=checkbox class=ck %s onchange='hg(this.checked)'>Hide aircraft on the ground</label>"
         "<label>Minimum altitude</label><select onchange='ma(this.value)'>%s</select>"
+        "<label>Maximum altitude</label><select onchange='mb(this.value)'>%s</select>"
         "<label><input type=checkbox class=ck %s onchange='mo(this.checked)'>Military aircraft only</label>"
         "<label>Aircraft trails</label><select onchange='tl(this.value)'>%s</select>"
         "<label>Max aircraft on screen</label><select onchange='mx(this.value)'>%s</select>"
-        "<label>Screen rotation (USB-C position)</label><select onchange='ro(this.value)'>%s</select>"
+        "<label><input type=checkbox class=ck %s onchange='bt(this.checked)'>Large text (restarts the device)</label>"
+        "<label>Screen rotation (degrees clockwise)</label>"
+        "<input type=number min=0 max=359 step=1 value='%d' onchange='ro(this.value)'>"
         "<label><input type=checkbox class=ck %s onchange='ck(this.checked)'>Show clock on idle</label>"
         "<label>Units</label><select onchange='u(this.value)'>%s</select></div>"
         "<div class=card><div class=t>Sound</div>"
@@ -485,13 +595,16 @@ static void handleRoot() {
         "function m(c){fetch('/vol?mute='+(c?1:0)+'&save=1')}"
         "function t(){fetch('/vol?test=1')}"
         "function d(v){fetch('/idle?v='+v+'&save=1')}"
+        "function fd(c){fetch('/fdsleep?v='+(c?1:0)+'&save=1')}"
         "function sw(c){fetch('/sweep?v='+(c?1:0)+'&save=1')}"
         "function ap(c){fetch('/airports?v='+(c?1:0)+'&save=1')}"
         "function hg(c){fetch('/ground?v='+(c?1:0)+'&save=1')}"
         "function ma(v){fetch('/altmin?v='+v+'&save=1')}"
+        "function mb(v){fetch('/altmax?v='+v+'&save=1')}"
         "function mo(c){fetch('/milonly?v='+(c?1:0)+'&save=1')}"
         "function tl(v){fetch('/trail?v='+v+'&save=1')}"
         "function mx(v){fetch('/maxac?v='+v+'&save=1')}"
+        "function bt(c){fetch('/bigtext?v='+(c?1:0)+'&save=1')}"
         "function ro(v){fetch('/rotate?v='+v+'&save=1')}"
         "function u(v){fetch('/units?v='+v+'&save=1')}"
         "function al(v){fetch('/alerts?mode='+v+'&save=1')}"
@@ -508,9 +621,9 @@ static void handleRoot() {
         "if(b>=0)e.selectedIndex=b;})();</script></body></html>",
         g_settings.homeLat, g_settings.homeLon, gpsRow.c_str(), ropts.c_str(), topts.c_str(),
         tzopts.c_str(),
-        g_brightnessDay, iopts.c_str(), g_showSweep ? "checked" : "",
-        g_showAirports ? "checked" : "", g_hideGround ? "checked" : "", maopts.c_str(), g_milOnly ? "checked" : "",
-        tlopts.c_str(), mxopts.c_str(), rotopts.c_str(), g_clockEnabled ? "checked" : "", uopts.c_str(),
+        g_brightnessDay, iopts.c_str(), g_fdSleep ? "checked" : "", g_showSweep ? "checked" : "",
+        g_showAirports ? "checked" : "", g_hideGround ? "checked" : "", maopts.c_str(), mbopts.c_str(), g_milOnly ? "checked" : "",
+        tlopts.c_str(), mxopts.c_str(), g_bigText ? "checked" : "", g_rotation, g_clockEnabled ? "checked" : "", uopts.c_str(),
         g_volume, g_muted ? "checked" : "", aopts.c_str(), popts.c_str(),
         g_settings.homeLat, g_settings.homeLon, (g_tz == TZ_STR ? 0 : 1));
     g_web.send(200, "text/html", buf);
@@ -566,7 +679,7 @@ static void handleWifi() {
 
 static void handleBright() {
     if (g_web.hasArg("v")) {
-        g_brightnessDay = constrain((int)g_web.arg("v").toInt(), 0, 255);
+        g_brightnessDay = constrain((int)g_web.arg("v").toInt(), 5, 255);  // floor 5: 0 looks like a dead board
         applyBrightness();
         if (g_web.hasArg("save")) {
             Preferences p;
@@ -597,7 +710,11 @@ static void handleVol() {
 
 static void handleAlerts() {   // what triggers the alert sound (live)
     if (g_web.hasArg("mode")) g_alertMode   = constrain((int)g_web.arg("mode").toInt(), 0, 2);
-    if (g_web.hasArg("prox")) g_proximityKm = g_web.arg("prox").toFloat();   // km (0 = off)
+    if (g_web.hasArg("prox")) {
+        g_proximityKm = g_web.arg("prox").toFloat();   // km (0 = off)
+        g_requeryKm = queryRadiusKm();                 // the query must cover the new alert circle
+        g_requery = true;
+    }
     if (g_web.hasArg("save")) {
         Preferences p;
         p.begin("capsuleradar", false);
@@ -680,6 +797,20 @@ static void handleAltMin() {   // minimum-altitude feed filter, ft (applies from
     g_web.send(200, "text/plain", "ok");
 }
 
+static void handleAltMax() {   // maximum-altitude feed filter, ft (applies from the next poll)
+    if (g_web.hasArg("v")) {
+        g_maxAltFt = constrain((int)g_web.arg("v").toInt(), 0, 60000);
+        g_adsb.setMaxAltFt((float)g_maxAltFt);
+        if (g_web.hasArg("save")) {
+            Preferences p;
+            p.begin("capsuleradar", false);
+            p.putInt("maxalt", g_maxAltFt);
+            p.end();
+        }
+    }
+    g_web.send(200, "text/plain", "ok");
+}
+
 static void handleMilOnly() {   // military-only feed filter (applies from the next poll)
     if (g_web.hasArg("v")) {
         g_milOnly = g_web.arg("v").toInt() != 0;
@@ -690,6 +821,18 @@ static void handleMilOnly() {   // military-only feed filter (applies from the n
             p.putBool("milonly", g_milOnly);
             p.end();
         }
+    }
+    g_web.send(200, "text/plain", "ok");
+}
+
+static void handleBigText() {   // accessibility: large fonts. Fonts are baked at UI creation,
+    if (g_web.hasArg("v")) {    // so persist the flag and reboot cleanly to apply it.
+        g_bigText = g_web.arg("v").toInt() != 0;
+        Preferences p;
+        p.begin("capsuleradar", false);
+        p.putBool("bigtext", g_bigText);
+        p.end();
+        g_rebootAtMs = millis() + 1200;   // let this response reach the browser first
     }
     g_web.send(200, "text/plain", "ok");
 }
@@ -722,6 +865,19 @@ static void handleAirports() {   // show/hide airport markers (live)
     g_web.send(200, "text/plain", "ok");
 }
 
+static void handleFdSleep() {   // face-down sleep (screen off when flipped over) on/off
+    if (g_web.hasArg("v")) {
+        g_fdSleep = g_web.arg("v").toInt() != 0;
+        if (g_web.hasArg("save")) {
+            Preferences p;
+            p.begin("capsuleradar", false);
+            p.putBool("fdsleep", g_fdSleep);
+            p.end();
+        }
+    }
+    g_web.send(200, "text/plain", "OK");
+}
+
 static void handleGround() {   // hide/show on-ground aircraft (applies from the next feed poll)
     if (g_web.hasArg("v")) {
         g_hideGround = g_web.arg("v").toInt() != 0;
@@ -736,14 +892,15 @@ static void handleGround() {   // hide/show on-ground aircraft (applies from the
     g_web.send(200, "text/plain", "ok");
 }
 
-static void handleRotate() {   // display rotation 0/90/180/270 for any USB-C orientation (live)
+static void handleRotate() {   // arbitrary clockwise display rotation, applied live
     if (g_web.hasArg("v")) {
-        g_rotation = constrain((int)g_web.arg("v").toInt(), 0, 3);
-        display::setRotation((uint8_t)g_rotation);
+        g_rotation = constrain((int)g_web.arg("v").toInt(), 0, 359);
+        display::setRotation((uint16_t)g_rotation);
+        g_rotation = display::rotation();
         if (g_web.hasArg("save")) {
             Preferences p;
             p.begin("capsuleradar", false);
-            p.putInt("rot", g_rotation);
+            p.putInt("rotDeg", g_rotation);
             p.end();
         }
     }
@@ -824,7 +981,7 @@ static void handleUpdateUpload() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println("\nCapsule Radar boot");
+    Serial.println("\nCapsule Radar boot  fw " FW_VERSION "  board " BOARD_NAME);
 
     if (PIN_LCD_SCLK < 0 || PIN_I2C_SDA < 0) {
         Serial.println("[!] Pins in config.h are still -1. Copy them from the Waveshare demo.");
@@ -857,18 +1014,36 @@ void setup() {
         g_showAirports = p.getBool("airports", true);
         g_hideGround = p.getBool("hideground", false);
         g_minAltFt = p.getInt("minalt", 0);
+        g_maxAltFt = p.getInt("maxalt", 0);
+        g_lastView = p.getInt("lastview", 0);
         g_milOnly = p.getBool("milonly", false);
-        g_rotation = p.getInt("rot", 0);
+        // Migrate the old quarter-turn setting (rot=0..3) without changing existing
+        // installations' orientation. New firmware stores actual degrees separately.
+        g_rotation = p.isKey("rotDeg") ? p.getInt("rotDeg", 0) : p.getInt("rot", 0) * 90;
+        g_rotation = constrain(g_rotation, 0, 359);
         p.end();
         radar::setTheme(t);
         radar::setSweepEnabled(g_showSweep);
         radar::setAirportsEnabled(g_showAirports);
         g_adsb.setHideGround(g_hideGround);
         g_adsb.setMinAltFt((float)g_minAltFt);
+        g_adsb.setMaxAltFt((float)g_maxAltFt);
         g_adsb.setMilitaryOnly(g_milOnly);
+        // restore the last active view (car installs power-cycle constantly) and keep
+        // remembering it; NVS write only when the view actually changes.
+        ui_show_view(g_lastView);
+        ui_set_view_changed_cb([](int idx) {
+            if (idx == g_lastView) return;
+            g_lastView = idx;
+            Preferences q;
+            q.begin("capsuleradar", false);
+            q.putInt("lastview", idx);
+            q.end();
+        });
         radar::setTrailLength(g_trailLen);
         radar::setMaxOnScreen(g_maxAc);
-        display::setRotation((uint8_t)g_rotation);
+        display::setRotation((uint16_t)g_rotation);
+        g_rotation = display::rotation();
     }
     radar::setThemeChangedCb(saveTheme);
     ui_set_range_cb(onRangeChange);              // on-screen zoom button
@@ -916,10 +1091,12 @@ void setup() {
         Serial.println("[wifi] new credentials saved -> rebooting for a clean web/mDNS start");
         g_rebootAtMs = millis() + 2500;   // let the portal deliver its 'saved' page first
     });
-    if (g_wm.autoConnect("CapsuleRadar-Setup"))
+    if (g_wm.autoConnect("CapsuleRadar-Setup")) {
         Serial.println("[wifi] connected");
-    else
+    } else {
         Serial.println("[wifi] config portal open - join 'CapsuleRadar-Setup' to set WiFi; UI stays live");
+        g_bootedIntoPortal = true;   // saved WiFi may just not be up yet (car hotspot) -> loop() retries it
+    }
 #else
     // DIAG_NO_WIFI: skip all WiFi so the RGB panel runs with the radio off. Used to confirm
     // the display is stable on its own and isolate the RGB-LCD + WiFi interrupt-watchdog reset.
@@ -931,8 +1108,10 @@ void setup() {
 
 #if !defined(DIAG_NO_WIFI)
     // --- ADS-B client + task ----------------------------------------------
-    float queryKm = constrain(g_settings.rangeKm * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
+    float queryKm = queryRadiusKm();
     g_adsb.begin(g_settings.homeLat, g_settings.homeLon, queryKm);
+    wx_radar_begin();
+    cloud_image_begin();
     g_ac_mutex = xSemaphoreCreateMutex();
     // TLS needs a big stack. 32 KB (was 16 KB): the LCD-2.1 build uses ESP-IDF-mode mbedTLS,
     // whose handshake is more stack-hungry than the AMOLED precompiled libs — 16 KB overflowed
@@ -947,13 +1126,16 @@ void setup() {
     g_web.on("/vol", handleVol);
     g_web.on("/alerts", handleAlerts);
     g_web.on("/idle", handleIdle);
+    g_web.on("/fdsleep", handleFdSleep);
     g_web.on("/sweep", handleSweep);
     g_web.on("/airports", handleAirports);
     g_web.on("/ground", handleGround);
     g_web.on("/altmin", handleAltMin);
+    g_web.on("/altmax", handleAltMax);
     g_web.on("/milonly", handleMilOnly);
     g_web.on("/trail", handleTrail);
     g_web.on("/maxac", handleMaxAc);
+    g_web.on("/bigtext", handleBigText);
     g_web.on("/rotate", handleRotate);
     g_web.on("/gps", handleGps);
     g_web.on("/clock", handleClock);
@@ -986,6 +1168,22 @@ void loop() {
     // scheduled reboot after a fresh WiFi config (see setSaveConfigCallback)
     if (g_rebootAtMs && (int32_t)(millis() - g_rebootAtMs) >= 0) { delay(50); ESP.restart(); }
 
+    // Car use: the saved WiFi often appears 30-60 s AFTER boot (vehicle hotspot). If we booted
+    // into the portal despite having saved credentials, keep retrying them in the background;
+    // once the network shows up, reboot for a clean start (same rationale as the post-config
+    // reboot: WiFiManager's portal server doesn't hand port 80 / mDNS over cleanly).
+    if (g_bootedIntoPortal && !g_rebootAtMs) {
+        static uint32_t lastRetry = 0;
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("[wifi] saved network appeared -> restarting for a clean start");
+            g_rebootAtMs = millis() + 800;
+        } else if (millis() - lastRetry > 20000UL && g_wm.getWiFiIsSaved()) {
+            lastRetry = millis();
+            Serial.println("[wifi] retrying saved network in the background...");
+            WiFi.begin();                     // uses the stored credentials
+        }
+    }
+
     // OTA: set up once WiFi is up, then service it every loop (flash over the air)
     static bool otaUp = false;
     if (!otaUp && WiFi.status() == WL_CONNECTED) {
@@ -993,7 +1191,7 @@ void loop() {
         ArduinoOTA.begin();
         MDNS.addService("http", "tcp", 80);            // advertise the config web page
         otaUp = true;
-        Serial.println("[ota] ready: pio run -e esp32-s3-amoled-175-ota -t upload");
+        Serial.println("[ota] ready: pio run -e " BOARD_PIO_ENV "-ota -t upload");
     }
     if (otaUp) ArduinoOTA.handle();
 
@@ -1007,6 +1205,18 @@ void loop() {
             ui_on_data_updated();              // refresh card/list/stats
             checkAudioEvents();                // ping new-in-range / emergency / military
         }
+    }
+    if (g_weatherDirty) {
+        g_weatherDirty = false;
+        ui_on_data_updated();
+    }
+    if (g_wxRadarDirty) {
+        g_wxRadarDirty = false;
+        ui_on_data_updated();
+    }
+    if (g_cloudImageDirty) {
+        g_cloudImageDirty = false;
+        ui_on_data_updated();
     }
 
     // periodic: HUD clock + wifi/battery indicators
@@ -1040,9 +1250,11 @@ void loop() {
         // freeze but the icon would otherwise stay white.
         const bool feedFresh = wifiUp && (millis() - g_lastFeedOkMs < 18000UL);
         ui_set_status(wifiUp, feedFresh, rssi, clk);
-        char net[80];
+        char net[112];
         if (WiFi.status() == WL_CONNECTED)
-            snprintf(net, sizeof(net), "Configure at\ncapsuleradar.local\n%s", WiFi.localIP().toString().c_str());
+            // IP + the active centre point (helps users verify what actually got saved)
+            snprintf(net, sizeof(net), "Configure at\ncapsuleradar.local\n%s  |  %.5f, %.5f",
+                     WiFi.localIP().toString().c_str(), g_settings.homeLat, g_settings.homeLon);
         else
             snprintf(net, sizeof(net), "WiFi setup:\njoin CapsuleRadar-Setup");
         ui_set_netinfo(net);
@@ -1051,7 +1263,7 @@ void loop() {
         g_onBattery = bpresent && !battery_charging();
         // GPS HUD/Stats: 0 = off/no module (hidden), 1 = acquiring, 2 = fix
         const int gpsState = (!g_useGps || !gps_present()) ? 0 : (gps_has_fix() ? 2 : 1);
-        ui_set_gps(gpsState, gps_satellites());
+        ui_set_gps(gpsState, gps_satellites(), gps_altitude_m());
         // once NTP has a real fix, persist it to the RTC (core 1 only)
         if (!g_rtcSynced && time(nullptr) > 1700000000L) {
             time_t now = time(nullptr);
@@ -1067,7 +1279,7 @@ void loop() {
                 g_settings.homeLat = glat; g_settings.homeLon = glon;   // radar/coastline recenter
                 // re-query the new area — set the radius too (same formula as boot/zoom), or
                 // adsb_task would re-begin with a stale/zero g_requeryKm and fetch 0 aircraft.
-                g_requeryKm = constrain(g_settings.rangeKm * ADSB_QUERY_MULT, ADSB_QUERY_MIN_KM, ADSB_QUERY_MAX_KM);
+                g_requeryKm = queryRadiusKm();
                 g_requery = true;                                       // adsb_task re-queries the new area
                 Serial.printf("[gps] re-centred to %.4f, %.4f\n", glat, glon);
             }
@@ -1116,7 +1328,10 @@ void loop() {
             lv_disp_trig_activity(NULL);
         }
 
-        const bool sleep = (fdCount >= 4);   // ~1.6 s face-down
+        // tap-to-wake: a touch while dark means the pose detection is wrong (tilted mount,
+        // drifted baseline) — wake up and adopt the current pose as the new resting one.
+        if (g_asleep && display::inactiveMs() < 400) { fdCount = 0; imu_rebaseline(); }
+        const bool sleep = g_fdSleep && (fdCount >= 4);   // ~1.6 s face-down (web toggle)
         const bool idle  = g_idleDimMs > 0 && display::inactiveMs() > g_idleDimMs;
         if (sleep != g_asleep || idle != g_idle) {
             g_asleep = sleep;

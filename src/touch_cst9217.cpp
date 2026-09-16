@@ -1,9 +1,10 @@
 // CST9217 capacitive touch over I2C (Arduino). Ported from Waveshare's
 // esp_lcd_touch_cst9217: read 10 bytes from reg 0xD000, validate ACK 0xAB,
 // unpack the 12-bit X/Y of the first touch point. Single-touch is enough here.
+#include "touch.h"
 #include "config.h"
-#if defined(BOARD_AMOLED175)   // AMOLED-only touch; the LCD-2.1 build uses touch_cst820.cpp
-#include "touch_cst9217.h"
+
+#if TOUCH_DRIVER_CST9217
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -66,4 +67,4 @@ bool touch_read(uint16_t *ox, uint16_t *oy) {
     return true;
 }
 
-#endif  // BOARD_AMOLED175
+#endif  // TOUCH_DRIVER_CST9217

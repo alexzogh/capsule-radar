@@ -13,3 +13,4 @@ void gps_poll();                             // non-blocking state machine; call
 bool gps_has_fix();                          // a recent, valid position fix
 bool gps_location(double *lat, double *lon); // last fix (false if none)
 int  gps_satellites();                       // satellites in use/view (0 if none/unknown)
+float gps_altitude_m();                      // GPS altitude in metres (NAN if unknown)

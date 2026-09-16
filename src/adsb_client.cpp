@@ -24,24 +24,69 @@ struct PsramJsonAllocator : ArduinoJson::Allocator {
 };
 static PsramJsonAllocator s_jsonPsram;
 
+// NetworkClient::readBytes() treats a transient negative TLS read as end-of-input,
+// which makes ArduinoJson intermittently report IncompleteInput. Deliberately wrap
+// the client without overriding readBytes(): Stream's timed byte reader retries
+// temporary no-data reads until the configured timeout.
+class ReliableJsonStream : public Stream {
+public:
+    explicit ReliableJsonStream(Stream& source) : _source(source) {}
+    int available() override { return _source.available(); }
+    int read() override {
+        const int value = _source.read();
+        if (value >= 0) ++_bytesRead;
+        return value;
+    }
+    int peek() override { return _source.peek(); }
+    void flush() override { _source.flush(); }
+    size_t write(uint8_t) override { return 0; }
+    size_t bytesRead() const { return _bytesRead; }
+
+private:
+    Stream& _source;
+    size_t _bytesRead = 0;
+};
+
 void AdsbClient::begin(double homeLat, double homeLon, float rangeKm) {
     _lat = homeLat; _lon = homeLon; _rangeKm = rangeKm;
 }
 
+// Independent providers, tried in order. Same readsb payload, different URL shapes.
+// Order matters: airplanes.live stays first so an approved key is used when available
+// (it parks itself in seconds if not), then adsb.fi, whose 1 req/s limit is documented
+// and fixed, then adsb.lol, whose limits are dynamic and throttle hardest.
+struct AdsbProvider {
+    const char* host;
+    const char* pathFmt;   // lat, lon, radius-in-nm
+};
+static const AdsbProvider kProviders[ADSB_PROVIDER_COUNT] = {
+    { ADSB_PRIMARY_HOST,  "/v2/point/%.4f/%.4f/%.0f"        },
+    { ADSB_OPENDATA_HOST, "/api/v3/lat/%.4f/lon/%.4f/dist/%.0f" },
+    { ADSB_FALLBACK_HOST, "/v2/point/%.4f/%.4f/%.0f"        },
+};
+
 bool AdsbClient::poll(std::vector<Aircraft>& out) {
     if (WiFi.status() != WL_CONNECTED) return false;
-    // Prefer the primary host, and give it a quick second try before touching the fallback:
-    // the primary is reliable in practice, while the fallback can be slow to time out from
-    // some networks (turning one transient primary blip into a long no-data gap + amber HUD).
-    if (fetchFrom(ADSB_PRIMARY_HOST, out)) return true;
-    if (fetchFrom(ADSB_PRIMARY_HOST, out)) return true;   // transient blip -> retry the healthy host
-    return fetchFrom(ADSB_FALLBACK_HOST, out);            // last resort
+    // Try each independent provider once, skipping any that is parked or still inside its
+    // spacing window. Retrying a hard-failing provider every poll achieves nothing and just
+    // pushes the surviving ones over their own limits.
+    bool askedSomeone = false;
+    for (int i = 0; i < ADSB_PROVIDER_COUNT; ++i) {
+        if (cooling(i)) continue;
+        askedSomeone = true;
+        if (fetchFrom(i, out)) { _lastPollSkipped = false; return true; }
+    }
+    _lastPollSkipped = !askedSomeone;          // nothing was asked; not a failure
+    return false;
 }
 
-bool AdsbClient::fetchFrom(const char* host, std::vector<Aircraft>& out) {
+bool AdsbClient::fetchFrom(int slot, std::vector<Aircraft>& out) {
+    const char* host = kProviders[slot].host;
     const double nm = _rangeKm * 0.539957;            // km -> nautical miles (API radius unit)
+    char path[96];
+    snprintf(path, sizeof(path), kProviders[slot].pathFmt, _lat, _lon, nm);
     char url[160];
-    snprintf(url, sizeof(url), "https://%s/v2/point/%.4f/%.4f/%.0f", host, _lat, _lon, nm);
+    snprintf(url, sizeof(url), "https://%s%s", host, path);
 
     WiFiClientSecure client;
 #if ADSB_HTTPS_INSECURE
@@ -50,16 +95,78 @@ bool AdsbClient::fetchFrom(const char* host, std::vector<Aircraft>& out) {
     // client.setCACert(ROOT_CA_PEM);                  // production: pin the root CA
 #endif
 
+    _pacer.onAttempt(slot, millis());
+
     HTTPClient http;
     http.setReuse(false);
+    // Ask in HTTP/1.0, which has no chunked transfer encoding.
+    //
+    // This matters because we stream-parse straight off http.getStream(), and that is the
+    // RAW socket: Arduino's HTTPClient only de-chunks inside writeToStream()/getString().
+    // Against a chunked server (adsb.fi is one; adsb.lol sends Content-Length) ArduinoJson
+    // therefore saw the hex chunk-size line first, parsed "4000" as a perfectly good JSON
+    // number, and reported success with no "ac" key -- a 200 that silently yielded no
+    // aircraft. HTTP/1.0 makes the body either Content-Length- or close-delimited, both of
+    // which the streaming parser handles. Verified against all three providers.
+    http.useHTTP10(true);
     http.setConnectTimeout(6000);    // fail reasonably fast: a slow host must not block the
     http.setTimeout(8000);           // task (and the user's route/photo lookups) for too long
     if (!http.begin(client, url)) { Serial.printf("[adsb] begin failed (%s)\n", host); return false; }
-    http.addHeader("User-Agent", ADSB_USER_AGENT);
+    // MUST be setUserAgent(): addHeader() silently drops User-Agent (it is on
+    // HTTPClient's "handled by code" list), leaving the default "ESP32HTTPClient".
+    http.setUserAgent(ADSB_USER_AGENT);
     http.addHeader("Accept", "application/json");
+    const char* wanted[] = { "Retry-After" };
+    http.collectHeaders(wanted, 1);
 
     const int code = http.GET();
-    if (code != 200) { Serial.printf("[adsb] HTTP %d (%s)\n", code, host); http.end(); return false; }
+    if (code > 0) _lastResponseMs = millis();   // the server answered: TLS and heap are healthy
+    if (code != 200) {
+        char tls[128] = "";
+        const int tlsCode = client.lastError(tls, sizeof(tls));
+        // Log a bounded slice of the error body. Providers explain themselves here
+        // ("contact us for access", "rate limited", ...) and throwing it away turns an
+        // actionable message into a bare status code. Bounded + time-capped so a hostile
+        // or hanging response can never stall the poll task.
+        char body[161] = "";
+        if (code > 0) {
+            NetworkClient& es = http.getStream();
+            size_t n = 0;
+            const uint32_t t0 = millis();
+            while (n < sizeof(body) - 1 && (millis() - t0) < 500) {
+                if (!es.available()) {
+                    if (!es.connected()) break;
+                    delay(5);
+                    continue;
+                }
+                const int c = es.read();
+                if (c < 0) break;
+                body[n++] = (c == '\r' || c == '\n') ? ' ' : (char)c;
+            }
+            body[n] = '\0';
+        }
+        Serial.printf("[adsb] HTTP %d (%s) tls=%d '%s' heap=%u largest=%u psram=%u\n",
+                      code, host, tlsCode, tls,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                      (unsigned)ESP.getFreePsram());
+        if (body[0]) Serial.printf("[adsb]   body: %s\n", body);
+
+        if (code == 403) {
+            // Policy refusal: park it. Announce once, not on every poll.
+            if (_pacer.onRefused(slot, millis()))
+                Serial.printf("[adsb] %s parked for %us after HTTP 403\n",
+                              host, (unsigned)(ADSB_COOLDOWN_403_MS / 1000));
+        } else if (code == 429) {
+            // Back off multiplicatively; the limit is dynamic, so probe for what sticks.
+            const long ra = http.header("Retry-After").toInt();
+            const uint32_t sp = _pacer.onRateLimited(slot, millis(), ra);
+            if (sp)
+                Serial.printf("[adsb] %s rate-limited; spacing requests %us apart\n",
+                              host, (unsigned)(sp / 1000));
+        }
+        http.end(); return false;
+    }
 
     // Only keep the fields we use -> much smaller parsed document.
     JsonDocument filter(&s_jsonPsram);
@@ -72,14 +179,46 @@ bool AdsbClient::fetchFrom(const char* host, std::vector<Aircraft>& out) {
             filter[k][0][f] = true;
 
     JsonDocument doc(&s_jsonPsram);
-    DeserializationError err = deserializeJson(doc, http.getStream(),
+    const int expectedBytes = http.getSize();
+    NetworkClient& responseStream = http.getStream();
+    ReliableJsonStream jsonStream(responseStream);
+    // Match the HTTP client's budget. Without this the wrapper keeps Arduino Stream's default
+    // 1000 ms, so a TLS stall longer than 1 s mid-body still dropped the poll with
+    // IncompleteInput — proven by tests/adsb_json_stream_test.cpp case 3 (found by @geoffg28).
+    jsonStream.setTimeout(8000);
+    DeserializationError err = deserializeJson(doc, jsonStream,
                                                DeserializationOption::Filter(filter));
+    if (err) {
+        Serial.printf("[adsb] JSON parse failed (%s): %s; expected=%d read=%u available=%d connected=%d\n",
+                      host, err.c_str(), expectedBytes, (unsigned)jsonStream.bytesRead(),
+                      responseStream.available(), responseStream.connected());
+        http.end();
+        return false;
+    }
     http.end();
-    if (err) return false;
 
     JsonArrayConst arr = doc["ac"].as<JsonArrayConst>();
     if (arr.isNull()) arr = doc["aircraft"].as<JsonArrayConst>();
-    if (arr.isNull()) return false;
+    if (arr.isNull()) {
+        // Was silent, which made a provider that answers 200 with an unexpected shape
+        // indistinguishable from one that is never tried at all. It is also not a success:
+        // pace it like a 429, or a provider that changes its payload shape gets re-asked
+        // every poll forever — exactly the loop the chunked-response bug produced.
+        Serial.printf("[adsb] %s: 200 but no aircraft array (expected=%d read=%u)\n",
+                      host, expectedBytes, (unsigned)jsonStream.bytesRead());
+        const uint32_t sp = _pacer.onUnusable(slot);
+        if (sp)
+            Serial.printf("[adsb] %s unusable; spacing requests %us apart\n",
+                          host, (unsigned)(sp / 1000));
+        return false;
+    }
+
+    // Only now is the response genuinely usable, so only now does it count as a success
+    // for pacing purposes.
+    _lastHost = host;                   // so the caller can say who served the data
+    if (_pacer.onOk(slot))
+        Serial.printf("[adsb] %s steady; spacing eased to %us\n",
+                      host, (unsigned)(_pacer.spacingMs(slot) / 1000));
 
     // Keep the ADSB_MAX_AIRCRAFT *nearest* aircraft (not just the first ones the feed happens to
     // list), so busy areas still show the traffic closest to you. We gate by distance BEFORE
@@ -100,6 +239,7 @@ bool AdsbClient::fetchFrom(const char* host, std::vector<Aircraft>& out) {
         if (_hideGround && onGround) continue;
         // optional filters (applied before the cap, so slots only go to matching aircraft)
         if (_minAltFt > 0.0f && (onGround || altFt < _minAltFt)) continue;
+        if (_maxAltFt > 0.0f && !onGround && altFt > _maxAltFt) continue;  // low-traffic/heli spotting
         if (_milOnly && (((a["dbFlags"] | 0u) & 0x1) == 0)) continue;
 
         const float d = (float)geo::haversineKm(_lat, _lon, lat, lon);
