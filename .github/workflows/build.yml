@@ -1,0 +1,37 @@
+name: Build and test firmware
+
+on:
+  pull_request:
+  push:
+    branches: ['port/esp32-s3-lcd-21']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [esp32-s3-amoled-175, esp32-s3-amoled-143, esp32-s3-lcd-21]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build firmware
+        run: pio run -e ${{ matrix.env }}
+      - name: Host tests
+        if: matrix.env == 'esp32-s3-amoled-175'
+        run: ./tests/run_host_tests.sh
+      - name: Verify LCD interrupt configuration
+        if: matrix.env == 'esp32-s3-lcd-21'
+        run: |
+          SDK=.pio/build/esp32-s3-lcd-21/config/sdkconfig.h
+          for flag in LCD_RGB_ISR_IRAM_SAFE GDMA_ISR_IRAM_SAFE GDMA_CTRL_FUNC_IN_IRAM; do
+            grep -qx "#define CONFIG_${flag} 1" "$SDK"
+          done
