@@ -30,20 +30,19 @@ A live **ADS-B aircraft radar** for the **Waveshare ESP32-S3-Touch-AMOLED-1.75**
 
 ## Features
 
-- **Live traffic** from [airplanes.live](https://airplanes.live), [adsb.fi](https://adsb.fi/) and [adsb.lol](https://adsb.lol) (free, non-commercial), updated every couple of seconds. Each provider is paced independently, so one refusing or rate-limiting does not stop the feed. Memory-safe streaming parser with a hard aircraft cap.
-- **Four themes** (long-press the screen to cycle, or pick on the web; remembered across reboots):
+- **Live traffic** from [airplanes.live](https://airplanes.live), [adsb.fi](https://adsb.fi/) and [adsb.lol](https://adsb.lol) (free, non-commercial), updated every couple of seconds. Each provider is paced independently, so one refusing or rate-limiting does not stop the feed. Memory-safe streaming parser with a hard aircraft cap. *Note: airplanes.live is now [contributor-only](https://airplanes.live/get-started/) — if you run one of their feeders, your radar uses their API automatically from the same network (no keys, nothing to configure); otherwise it quietly falls back to adsb.fi / adsb.lol.*
+- **Four themes** (hold the radar still for 1.5 s, then lift, to cycle; or pick on the web; remembered across reboots):
   - **Phosphor** — green-on-black radar scope: rings, animated sweep, aircraft glyphs rotated by heading and color-coded by altitude, fading trails, emergency halo.
   - **Orb** — green gradient + grid scope: the 7 nearest aircraft as yellow orbs emitting waves, off-range traffic as edge arrows pointing its way, orange target rings.
   - **Amber CRT** and **Military** — the same scope retinted (warm amber / night-vision green).
-- **Touch** (CST9217): tap an aircraft → detail card (callsign, type, altitude, vertical speed, ground speed, distance, heading, squawk, and **origin → destination** looked up from adsbdb, cached in NVS). **Double-tap** to cycle zoom range. Swipe between **Radar / List / Stats** (circular layouts).
+- **Touch** (CST9217): tap an aircraft → detail card (callsign, type, altitude, vertical speed, ground speed, distance, ground track (HDG), squawk, and **origin → destination** looked up from adsbdb, cached in NVS); the X in its corner, a tap just outside the card, or a tap on empty scope closes it. The on-screen zoom button cycles the zoom range (10–100 km; the web page goes to 150 km). Swipe between **Radar / List / Stats** (circular layouts).
 - **Boot splash** + **alert pings** (ES8311 speaker): a soft ping when a new aircraft enters range, an urgent double-beep for emergency/military — volume & mute on the web page.
 - **Smooth motion**: aircraft glyphs glide between polls (interpolated) instead of jumping, using cheap partial redraws.
 - **Top HUD**: WiFi status (amber if the data feed is failing), in-range aircraft count, NTP/RTC clock, **battery %** (charging bolt, red when low), and the date. The Stats view footer shows how to reach the config page (`capsuleradar.local` + IP).
 - **Battery aware** (AXP2101): shows charge level, warns when low, and slows the feed poll rate on battery to save power.
 - **Real-time clock** (PCF85063): keeps the time/date across power loss, so the clock is right even before/without WiFi; re-synced from NTP when online.
-- **Tap-to-track**: double-tap a selected aircraft to lock the scope on it — the tracked plane stays centered while everything else moves relative to it. Tap again to unlock.
-- **Clock face idle mode**: after the configurable idle timeout, a full-screen clock overlay appears with the current time, date, aircraft count and nearest aircraft info. Shake the device or tap to wake. Toggleable from the web config page.
-- **Smart brightness**: configurable idle auto-dim (no touch), and **face-down sleep** (QMI8658 IMU — flip it over to turn the screen off).
+- **Smart brightness**: configurable idle auto-dim (no touch), and **face-down sleep** (QMI8658 IMU — flip it over to turn the screen off; a touch or turning it back up wakes it).
+- **Idle clock**: instead of dimming, the radar turns into an analog clock when nobody touches it — the sweep line spins onto the current second and becomes the second hand, the hour and minute hands grow out of the centre, N/E/S/W become 12/3/6/9, and the planes keep moving behind it, dimmed. A touch brings the radar back (that touch does nothing else), and so does an emergency squawk in range. The web page's "Clock or dim after" setting sets the wait; a web switch turns the clock off.
 - **GPS auto-location** (optional **-G** board variant): the Waveshare `-G` board has an onboard GPS (Quectel LC76G). Turn it on from the web page and the radar **sets its own center point automatically**, with an on-screen **satellite status icon** (amber while acquiring, green once it has a fix). Standard boards simply enter their location manually.
 - **Configuration web page** at `http://capsuleradar.local/` — center point (map picker), display range, theme, **time zone** (auto-detected from your browser), live brightness slider, sound, WiFi reset, and over-the-air firmware update. Settings persist in NVS.
 - **First-boot WiFi setup** via a captive portal (`CapsuleRadar-Setup`).
@@ -76,18 +75,46 @@ ESP32-S3R8 (8 MB PSRAM, 16 MB flash), **ST7701** IPS LCD over 16-bit RGB paralle
 
 Pin maps live in [`src/boards/`](src/boards/) (AMOLED boards) or inline in [`src/config.h`](src/config.h) (LCD 2.1), one header per board, selected by a `-DBOARD_*` build flag. They are taken from the vendor board definition and then **confirmed on hardware** — never guessed. Shared tunables stay in [`src/config.h`](src/config.h).
 
+### Waveshare ESP32-S3-Touch-LCD-2.1 (experimental)
+
+Contributed by @alexzogh in #45. **Experimental:** touch, WiFi, the feed and web updates work.
+Since 1.7.0 the panel streams through bounce buffers with a real page flip, which fixed the
+sideways picture shift ([#49](https://github.com/socquique/capsule-radar/issues/49)) and the
+tearing (#54).
+
+**Built the 2.1 locally before 1.7.0?** Settings already in the generated
+`sdkconfig.esp32-s3-lcd-21` win over `custom_sdkconfig` in `platformio.ini`, so delete that
+file, build any AMOLED board once (e.g. `pio run -e esp32-s3-amoled-175`, which puts back the
+stock framework libraries), then build the 2.1 again. Otherwise the build succeeds but keeps
+the old panel settings. Fresh clones and CI are not affected.
+
+The 2.1-inch board uses a 480×480 ST7701 RGB IPS panel, CST820 touch, and a
+TCA9554 GPIO expander. Its pin map and timings live in `src/boards/board_lcd_21.h`.
+It has no PMIC or audio codec; battery reporting and alert sounds are disabled.
+
+Build with `pio run -e esp32-s3-lcd-21`; upload over USB with `-t upload`, or use
+`pio run -e esp32-s3-lcd-21-ota -t upload` once connected to WiFi.
+Release assets include `CapsuleRadar-esp32s3-lcd21.bin` (merged USB image at 0x0)
+and `CapsuleRadar-ota-lcd21.bin` (app-only image for the device's web update page).
+The browser flasher currently supports the AMOLED boards.
+
+The LCD environment rebuilds ESP-IDF with IRAM-safe LCD/GDMA interrupts and octal
+PSRAM enabled for RGB refresh during WiFi flash operations. Its initial build takes
+longer than the AMOLED environments. The QSPI sweep compositor remains enabled on
+AMOLED; the RGB panel uses the shared LVGL sweep renderer.
+
 ### Where to buy the board
 
 The 1.75” board is in a **global stock squeeze** right now (even Waveshare lists it on backorder), so availability moves week to week. The official store is the reference; the Amazon links are what is actually in stock as of this writing.
 
 | Board | Waveshare official (ships worldwide) | Amazon (affiliate links) |
 |---|---|---|
-| **1.75” standard** — no case; the one the printed enclosure needs | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm) (backorder) | [.com](https://www.amazon.com/dp/B0F7XTJ1ZL?tag=capsuleradar-20) · [.es](https://www.amazon.es/dp/B0F7XTJ1ZL?tag=capsuleradar-21) · [.de](https://www.amazon.de/dp/B0F7XTJ1ZL?tag=capsulerada03-21) · [.co.uk](https://www.amazon.co.uk/dp/B0F7XTJ1ZL?tag=capsulerada0d-21) · [.it](https://www.amazon.it/dp/B0F7XTJ1ZL?tag=capsulerada08-21) · [.fr](https://www.amazon.fr/dp/B0F7XTJ1ZL?tag=capsulerada0e-21) — official Waveshare listing, restocking |
-| **1.75” -G** — adds GPS (auto-location, heading-up) | same page, pick the **-G** option | [.com](https://www.amazon.com/dp/B0F7XWWMJW?tag=capsuleradar-20) · [.es](https://www.amazon.es/dp/B0F7XWWMJW?tag=capsuleradar-21) · [.de](https://www.amazon.de/dp/B0F7XWWMJW?tag=capsulerada03-21) · [.co.uk](https://www.amazon.co.uk/dp/B0F7XWWMJW?tag=capsulerada0d-21) · [.it](https://www.amazon.it/dp/B0F7XWWMJW?tag=capsulerada08-21) · [.fr](https://www.amazon.fr/dp/B0F7XWWMJW?tag=capsulerada0e-21) — official Waveshare listing, restocking · [third-party, in stock](https://www.amazon.com/dp/B0F8867487?tag=capsuleradar-20) |
-| **1.75” -B** — the same board inside Waveshare's own case. Works, but you must open that case yourself and its shell is **not** the printed enclosure | same page, pick the **-B** option | [.com](https://www.amazon.com/dp/B0F7XTJ7JW?tag=capsuleradar-20) · [.es](https://www.amazon.es/dp/B0F7XTJ7JW?tag=capsuleradar-21) · [.de](https://www.amazon.de/dp/B0F7XTJ7JW?tag=capsulerada03-21) · [.co.uk](https://www.amazon.co.uk/dp/B0F7XTJ7JW?tag=capsulerada0d-21) · [.it](https://www.amazon.it/dp/B0F7XTJ7JW?tag=capsulerada08-21) · [.fr](https://www.amazon.fr/dp/B0F7XTJ7JW?tag=capsulerada0e-21) |
-| **1.43”** — the second supported board | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm), pick **without case** | [.es](https://www.amazon.es/dp/B0DV3KM88S?tag=capsuleradar-21) · [.de](https://www.amazon.de/dp/B0DV3KM88S?tag=capsulerada03-21) · [.co.uk](https://www.amazon.co.uk/dp/B0DV3KM88S?tag=capsulerada0d-21) · [.it](https://www.amazon.it/dp/B0DV3KM88S?tag=capsulerada08-21) · [.fr](https://www.amazon.fr/dp/B0DV3KM88S?tag=capsulerada0e-21) — no US listing; use the Waveshare store there |
-| **Battery** (optional) — 3.7 V LiPo, 1100 mAh, protection board, JST/MX1.25 plug (the one I run myself) | — | [.es](https://www.amazon.es/dp/B0F1FGZQS5?tag=capsuleradar-21) · [.com](https://www.amazon.com/dp/B0F1FGZQS5?tag=capsuleradar-20) · [.it](https://www.amazon.it/dp/B0F1FGZQS5?tag=capsulerada08-21) · [.fr](https://www.amazon.fr/dp/B0F1FGZQS5?tag=capsulerada0e-21) |
-| **Printed-parts hardware** — 6x2 mm disc magnets + M2x5 screws (counts per case variant on the MakerWorld page) | — | Magnets: [.es](https://www.amazon.es/dp/B0F4BZ447N?tag=capsuleradar-21) — elsewhere search “neodymium magnets 6x2mm”: [.com](https://www.amazon.com/s?k=neodymium+magnets+6x2mm&tag=capsuleradar-20) · [.de](https://www.amazon.de/s?k=neodym+magnete+6x2mm&tag=capsulerada03-21) · [.co.uk](https://www.amazon.co.uk/s?k=neodymium+magnets+6x2mm&tag=capsulerada0d-21) · [.it](https://www.amazon.it/s?k=magneti+neodimio+6x2mm&tag=capsulerada08-21) · [.fr](https://www.amazon.fr/s?k=aimants+neodyme+6x2mm&tag=capsulerada0e-21). M2x5 screws: [.es](https://www.amazon.es/s?k=tornillos+M2x5&tag=capsuleradar-21) · [.com](https://www.amazon.com/s?k=M2x5+machine+screws&tag=capsuleradar-20) |
+| **1.75″ standard** — no case; the one the printed enclosure needs | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm) (backorder) | 🇺🇸 [.com](https://www.amazon.com/dp/B0F7XTJ1ZL?tag=capsuleradar-20) · 🇪🇸 [.es](https://www.amazon.es/dp/B0F7XTJ1ZL?tag=capsuleradar-21) · 🇩🇪 [.de](https://www.amazon.de/dp/B0F7XTJ1ZL?tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/dp/B0F7XTJ1ZL?tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/dp/B0F7XTJ1ZL?tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/dp/B0F7XTJ1ZL?tag=capsulerada0e-21) · 🇯🇵 [.co.jp](https://www.amazon.co.jp/dp/B0F7XTJ1ZL?tag=capsuleradar-22) · 🇨🇦 [.ca](https://www.amazon.ca/dp/B0F7XTJ1ZL?tag=capsulerada09-20) — official Waveshare listing, restocking |
+| **1.75″ -G** — adds GPS (auto-location, heading-up) | same page, pick the **-G** option | 🇺🇸 [.com](https://www.amazon.com/dp/B0F7XWWMJW?tag=capsuleradar-20) · 🇪🇸 [.es](https://www.amazon.es/dp/B0F7XWWMJW?tag=capsuleradar-21) · 🇩🇪 [.de](https://www.amazon.de/dp/B0F7XWWMJW?tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/dp/B0F7XWWMJW?tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/dp/B0F7XWWMJW?tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/dp/B0F7XWWMJW?tag=capsulerada0e-21) · 🇯🇵 [.co.jp](https://www.amazon.co.jp/dp/B0F7XWWMJW?tag=capsuleradar-22) · 🇨🇦 [.ca](https://www.amazon.ca/dp/B0F7XWWMJW?tag=capsulerada09-20) — official Waveshare listing, restocking · 🇺🇸 [third-party, in stock](https://www.amazon.com/dp/B0F8867487?tag=capsuleradar-20) |
+| **1.75″ -B** — the same board inside Waveshare's own case. Works, but you must open that case yourself and its shell is **not** the printed enclosure | same page, pick the **-B** option | 🇺🇸 [.com](https://www.amazon.com/dp/B0F7XTJ7JW?tag=capsuleradar-20) · 🇪🇸 [.es](https://www.amazon.es/dp/B0F7XTJ7JW?tag=capsuleradar-21) · 🇩🇪 [.de](https://www.amazon.de/dp/B0F7XTJ7JW?tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/dp/B0F7XTJ7JW?tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/dp/B0F7XTJ7JW?tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/dp/B0F7XTJ7JW?tag=capsulerada0e-21) · 🇯🇵 [.co.jp](https://www.amazon.co.jp/dp/B0F7XTJ7JW?tag=capsuleradar-22) · 🇨🇦 [.ca](https://www.amazon.ca/dp/B0F7XTJ7JW?tag=capsulerada09-20) |
+| **1.43″** — the second supported board | [product page](https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm), pick **without case** | 🇪🇸 [.es](https://www.amazon.es/dp/B0DV3KM88S?tag=capsuleradar-21) · 🇩🇪 [.de](https://www.amazon.de/dp/B0DV3KM88S?tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/dp/B0DV3KM88S?tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/dp/B0DV3KM88S?tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/dp/B0DV3KM88S?tag=capsulerada0e-21) · 🇯🇵 [.co.jp](https://www.amazon.co.jp/dp/B0DT9PSDW6?tag=capsuleradar-22) · 🇨🇦 [.ca](https://www.amazon.ca/dp/B0DT9PSDW6?tag=capsulerada09-20) — no US listing; use the Waveshare store there |
+| **Battery** (optional) — 3.7 V LiPo, 1100 mAh, protection board, JST/MX1.25 plug (the one I run myself) | — | 🇪🇸 [.es](https://www.amazon.es/dp/B0F1FGZQS5?tag=capsuleradar-21) · 🇺🇸 [.com](https://www.amazon.com/dp/B0F1FGZQS5?tag=capsuleradar-20) · 🇮🇹 [.it](https://www.amazon.it/dp/B0F1FGZQS5?tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/dp/B0F1FGZQS5?tag=capsulerada0e-21) (DE/UK: that exact pack is not listed — search for a *protected* 3.7 V LiPo, ~1100 mAh, size **102540**, 1.25 mm micro-JST plug) — ⚠️ check the plug's **polarity** against the board's markings before connecting; it is not standardised across vendors |
+| **Printed-parts hardware** — 6×2 mm disc magnets + M2×5 screws (counts per case variant on the MakerWorld page) | — | Magnets, the ones I used: 🇪🇸 [.es](https://www.amazon.es/dp/B0F4BZ447N?tag=capsuleradar-21) — elsewhere search “neodymium magnets 6x2mm”: 🇺🇸 [.com](https://www.amazon.com/s?k=neodymium+magnets+6x2mm&tag=capsuleradar-20) · 🇩🇪 [.de](https://www.amazon.de/s?k=neodym+magnete+6x2mm&tag=capsulerada03-21) · 🇬🇧 [.co.uk](https://www.amazon.co.uk/s?k=neodymium+magnets+6x2mm&tag=capsulerada0d-21) · 🇮🇹 [.it](https://www.amazon.it/s?k=magneti+neodimio+6x2mm&tag=capsulerada08-21) · 🇫🇷 [.fr](https://www.amazon.fr/s?k=aimants+neodyme+6x2mm&tag=capsulerada0e-21) · 🇯🇵 [.co.jp](https://www.amazon.co.jp/s?k=neodymium+magnets+6x2mm&tag=capsuleradar-22) · 🇨🇦 [.ca](https://www.amazon.ca/s?k=neodymium+magnets+6x2mm&tag=capsulerada09-20). M2×5 screws: 🇪🇸 [.es](https://www.amazon.es/s?k=tornillos+M2x5&tag=capsuleradar-21) · 🇺🇸 [.com](https://www.amazon.com/s?k=M2x5+machine+screws&tag=capsuleradar-20) |
 
 > **Do not buy the “1.75C”** (`ESP32-S3-Touch-AMOLED-1.75C`, aluminum case): despite the name it is a **different board** and this firmware does not run on it.
 
@@ -145,14 +172,11 @@ src/
   display_lcd21.*    ST7701 RGB-LCD + TCA9554 backlight (LCD 2.1)
   radar_view.*       the radar scope, aircraft, themes
   ui.*               views (radar/list/stats) + detail card + HUD
-  ui_clock.*         clock face idle-mode overlay
-  touch_cst9217.*    capacitive touch driver (AMOLED 1.75)
-  touch_cst820.*     capacitive touch driver (LCD 2.1)
-  tca9554.*          I2C GPIO expander helper (LCD 2.1)
-  imu_qmi8658.*      accelerometer (face-down sleep / shake-to-wake)
-  battery.*          AXP2101 battery gauge (AMOLED only)
-  rtc_pcf85063.*     PCF85063 real-time clock (AMOLED only)
-  adsb_client.*      airplanes.live fetch + parse
+  touch_cst9217.*    capacitive touch driver
+  imu_qmi8658.*      accelerometer (face-down sleep)
+  battery.*          AXP2101 battery gauge
+  rtc_pcf85063.*     PCF85063 real-time clock
+  adsb_client.*      airplanes.live / adsb.fi / adsb.lol fetch + parse (with adsb_pacing.h)
   route*.* route.*   origin→destination lookup (adsbdb)
   sim_main.cpp       native SDL simulator (not flashed)
 include/lv_conf.h    LVGL config (v8)
@@ -163,9 +187,9 @@ docs/                hardware / data-source / architecture notes
 
 ## Community ports & forks
 
-The reference board is the **Waveshare ESP32-S3-Touch-AMOLED-1.75**, but other boards are welcome upstream: a port contributed as a pull request (its own PlatformIO env + board header in [`src/boards/`](src/boards/)) gets built by the CI on every release alongside the 1.75 — the in-tree **1.43** port is the worked example to copy, and the 2.1" port below is on that path. Ports that prefer to stay independent live as forks, linked here (MIT: fork away, and tell me so I can add yours).
+The reference board is the **Waveshare ESP32-S3-Touch-AMOLED-1.75**, but other boards are welcome upstream: a port contributed as a pull request (its own PlatformIO env + board header in [`src/boards/`](src/boards/)) gets built by the CI on every release alongside the 1.75 — the in-tree **1.43** port is the worked example to copy, and the **2.1"** port by @alexzogh is now in-tree too (experimental, above). Ports that prefer to stay independent live as forks, linked here (MIT: fork away, and tell me so I can add yours).
 
-- **[Capsule Radar for the Waveshare ESP32-S3-Touch-LCD-2.1](https://github.com/alexzogh/capsule-radar/tree/port/esp32-s3-lcd-21)** by **@alexzogh (STLWarehouse)** — a full port to the 2.1" round LCD (ST7701), plus new features: **double-tap to track an aircraft** (scope re-centres on it), a **clock face on idle**, and the busy-airspace **query-radius fix** now merged back into this firmware. Ships its own binaries per release (files with `lcd21` in the name are the 2.1 builds).
+- **[Capsule Radar for the Waveshare ESP32-S3-Touch-LCD-2.1](https://github.com/alexzogh/capsule-radar/tree/port/esp32-s3-lcd-21)** by **@alexzogh (STLWarehouse)** — a full port to the 2.1" round LCD (ST7701), plus new features: **double-tap to track an aircraft** (scope re-centres on it), a **clock face on idle**, and the busy-airspace **query-radius fix** now merged back into this firmware. The board itself is now built in-tree with every release (files with `lcd21` in the name); the fork keeps its extra features.
 - **[Capsule Radar for the Waveshare 2.8" (non-touch)](https://github.com/ijord/capsule-radar)** by **@ijord** — port to the 2.8" ST7701 panel, with a smoother sweep compositor and the **PNG heap-corruption fix** that shipped upstream in v1.3.28. Thank you!
 - **[Skyglass](https://github.com/SilentWolf75/skyglass)** by **@SilentWolf75** — an independently evolved sibling (190+ commits): **shaded OpenStreetMap basemap rendered on-device** and **ESP32-P4** support.
 

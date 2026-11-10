@@ -1,5 +1,5 @@
 // QMI8658 accelerometer over I2C (Arduino). Shares the bus with the touch (SDA/SCL
-// in config.h). We only need gravity on the Z axis to detect a face-down board.
+// in config.h). We only need gravity on the Z axis; facedown_sleep.h decides "face-down".
 #include "imu_qmi8658.h"
 #include "config.h"
 #include <Arduino.h>
@@ -11,13 +11,9 @@
 #define QMI_CTRL7   0x08   // sensor enable
 #define QMI_AZ_L    0x39   // accel Z low byte (high byte at 0x3A)
 
-// ±2g full scale -> 16384 LSB/g.
-#define FACEDOWN_THRESHOLD (9000)   // ~0.55 g past zero on the side opposite the resting one
 
 static uint8_t s_addr    = 0x6B;
 static bool    s_ok      = false;
-static int32_t s_ref     = 0;      // slow baseline of the resting az (see imu_facedown)
-static bool    s_haveRef = false;
 
 static bool wr(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(s_addr);
@@ -55,59 +51,10 @@ bool imu_begin() {
     return false;
 }
 
-// Read all three accel axes (X, Y, Z) for shake detection.
-// Returns true if reads succeeded; fills ax, ay, az in raw LSB (±2 g = 16384 LSB/g).
-#define QMI_AX_L  0x35
-static bool read_accel_xyz(int16_t &ax, int16_t &ay, int16_t &az) {
+bool imu_read_az(int16_t *az) {
     if (!s_ok) return false;
-    uint8_t b[6];
-    if (!rd(QMI_AX_L, b, 6)) return false;
-    ax = (int16_t)((b[1] << 8) | b[0]);
-    ay = (int16_t)((b[3] << 8) | b[2]);
-    az = (int16_t)((b[5] << 8) | b[4]);
-    return true;
-}
-
-// Shake detection: compare the magnitude of acceleration against the gravity
-// baseline (1 g ~ 16384 LSB). A spike above ~1.4 g indicates the device was
-// picked up, tapped, or shaken. Debounce: true at most once per 800 ms.
-#define SHAKE_THRESHOLD  5600   // LSB above/below 1g magnitude (~0.34 g delta)
-#define SHAKE_COOLDOWN_MS 800
-bool imu_shaken() {
-    int16_t ax, ay, az;
-    if (!read_accel_xyz(ax, ay, az)) return false;
-    // Compute |accel| via integer math (avoid float sqrt on ESP32 in tight loop).
-    // magnitude^2 in units of LSB^2; compare against (1g ± threshold)^2.
-    const int32_t mag2 = (int32_t)ax * ax + (int32_t)ay * ay + (int32_t)az * az;
-    const int32_t g = 16384;   // 1 g in LSB at ±2 g scale
-    const int32_t lo = g - SHAKE_THRESHOLD;
-    const int32_t hi = g + SHAKE_THRESHOLD;
-    const bool spike = (mag2 > (int32_t)hi * hi) || (mag2 < (int32_t)lo * lo);
-    if (!spike) return false;
-    static uint32_t lastShake = 0;
-    const uint32_t now = millis();
-    if (now - lastShake < SHAKE_COOLDOWN_MS) return false;
-    lastShake = now;
-    return true;
-}
-
-// 1 = face-down, 0 = not, -1 = couldn't read (shared I2C bus is noisy — a failed read
-// must NOT be treated as "not face-down", or it keeps resetting the debounce counter and
-// the screen never sleeps).
-int imu_facedown() {
-    if (!s_ok) return -1;
     uint8_t b[2];
-    if (!rd(QMI_AZ_L, b, 2)) return -1;
-    const int16_t az = (int16_t)((b[1] << 8) | b[0]);
-
-    // Orientation-agnostic: we don't assume which Z sign is "up" (it depends on how the
-    // board sits in the case, and it isn't the same on every unit). Track a slow baseline
-    // of the *resting* az and call it face-down when gravity swings to the far OPPOSITE
-    // side — i.e. the device was flipped over. Works whatever the sensor's sign.
-    if (!s_haveRef) { s_ref = az; s_haveRef = true; }
-    const bool down = (s_ref < 0) ? (az > FACEDOWN_THRESHOLD) : (az < -FACEDOWN_THRESHOLD);
-    if (!down) s_ref += (az - s_ref) >> 4;   // EMA toward the current (not-face-down) orientation
-    return down ? 1 : 0;
+    if (!rd(QMI_AZ_L, b, 2)) return false;
+    *az = (int16_t)((b[1] << 8) | b[0]);
+    return true;
 }
-
-void imu_rebaseline() { s_haveRef = false; }

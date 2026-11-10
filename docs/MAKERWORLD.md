@@ -51,7 +51,7 @@ speaker, a small kickstand foot, and an engraved logo. Snap-/screw-together, no 
   refreshed every couple of seconds.
 - 👆 **Touch**: tap an aircraft → full detail card + **route** (origin → destination).
   Swipe between **Radar / List / Stats** views.
-- 🎨 **Four themes** (long-press to switch): phosphor scope, a retro "orb" radar skin,
+- 🎨 **Four themes** (hold the radar for 1.5 s to switch): phosphor scope, a retro "orb" radar skin,
   amber CRT, and night-vision green.
 - 🔁 **On-screen zoom** button (10–100 km) and a **web config page** at
   `capsuleradar.local` (centre point, range, theme, brightness, sound, dim timer).
@@ -59,7 +59,7 @@ speaker, a small kickstand foot, and an engraved logo. Snap-/screw-together, no 
   for emergency/military squawks. Volume + mute on the web.
 - 🔋 **Battery-aware** (optional LiPo): on-screen %, low warning, slower polling on
   battery. 🕐 **Real-time clock** keeps time/date across power loss; **NTP** sync.
-- 🌙 **Smart dimming**: configurable idle auto-dim (Dim screen after…) and **face-down
+- 🌙 **Smart dimming**: an idle analog clock or auto-dim (Clock or dim after…) and **face-down
   sleep** (flip it over to turn the screen off).
 - ⚡ **Browser flashing** (ESP Web Tools) — or download a single `.bin`. First boot
   opens a WiFi setup hotspot; enter your network from your phone and you're live.

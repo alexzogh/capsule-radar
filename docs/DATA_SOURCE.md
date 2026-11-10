@@ -1,12 +1,16 @@
 # Data source — ADS-B feed
 
-## Primary: airplanes.live (free, no key)
-Independent ADS-B/MLAT aggregator. **Educational / non-commercial use only** — fits this project. Be a good citizen: poll every 1–2 s max, send a descriptive `User-Agent`.
+## Primary: airplanes.live (contributor-only)
+Independent, community-owned ADS-B/MLAT aggregator. **Educational / non-commercial use only** — fits this project. Be a good citizen: poll every 1–2 s max, send a descriptive `User-Agent`.
 
-> **Access now requires prior approval.** Unapproved clients get `403` with
-> *"Please contact us at contact@airplanes.live. Your email MUST include any links, a
-> description of the project, and any information you deem appropriate."* Until that is
-> granted the firmware parks this provider and runs on the two below.
+> **Access is now contributor-only (since Sept 2026), granted by IP.** If you run one of
+> their feeders (an ADS-B receiver contributing data — see
+> <https://airplanes.live/get-started/>), every device on the same network gets the API
+> automatically, this radar included: nothing to configure, no keys exist. Everyone else
+> gets `403`; the firmware then parks this provider with an **escalating backoff (15 min
+> doubling up to 6 h)** and runs on the two below — start feeding and the provider comes
+> back within hours, or immediately after a reboot. Running a feeder is also the way to
+> support them; their hosting costs are real.
 
 ### Endpoint (position + radius)
 ```
@@ -55,25 +59,54 @@ valid contact info"*), which is why the UA must carry a project link.
 
 ## Provider pacing (how the firmware behaves)
 Providers are tried in order and paced **individually**:
-- **403** — a policy refusal (needs approval, or a rejected User-Agent). Parked for 15 min;
-  retrying it every poll only burns requests and pushes the others over their limits.
-- **429** — too fast. An adaptive minimum spacing doubles on each 429 and eases back after a
-  run of successes. An explicit `Retry-After` wins.
+- **403** — a policy refusal (needs approval, or a rejected User-Agent). Parked for 15 min,
+  doubling up to 6 h; retrying it every poll only burns requests and pushes the others over
+  their limits.
+- **429** — too fast. An adaptive minimum spacing doubles on each 429 and eases back one step
+  after a run of successes *and* 10 minutes without a 429, so a provider with a fixed limit
+  (airplanes.live) is not re-tripped every couple of minutes. It never eases back onto the
+  spacing that drew the last 429 until an hour later, so it settles on the rate that works and
+  re-tests the faster one at most hourly. An explicit `Retry-After` wins.
 - **200 with no aircraft array** — the response parsed but is unusable (a provider changed its
   payload shape, or the chunked-encoding trap below). Same backoff as a 429: without it such a
   provider is re-asked every poll forever, which is exactly the loop that hid the adsb.fi
   chunking bug.
+- **No answer at all** (connect, TLS or read timeout) — the first one is free; from the second
+  in a row the provider waits a doubling gap (4 s up to 60 s), so one dead host cannot
+  monopolise the poll budget. The gap clears on the provider's first usable answer, so a short
+  internet outage does not leave the feed slow afterwards. While **every** provider is silent
+  (parked, or failing without an answer) the gap is capped at 10 s
+  (`ADSB_SILENCE_OUTAGE_MAX_MS`), so after a network-wide outage the next poll is at most 10 s
+  late rather than up to a minute. As soon as any provider answers, the others wait their full
+  gap again; the 429 spacing is never capped.
 
 The policy lives in `src/adsb_pacing.h`, separate from the HTTP code so it can be driven on
 the host — `tests/adsb_pacing_test.cpp` exercises parking, backoff, easing, `Retry-After` and
 `millis()` rollover without hardware.
 
-The **self-heal watchdog** in `main.cpp` reboots the device after 180 s without a feed, on the
-assumption that the internal heap has fragmented and TLS can no longer allocate. A refusal is
-not that: a 403 arrives over a working TLS session, and a poll we deliberately paced never
-left the device. Both refresh the watchdog via `AdsbClient::lastResponseMs()` — otherwise a
-feed every provider refuses reboots the device every three minutes, and each boot asks all
-three of them again.
+The **self-heal watchdog** (`FeedWatchdog` in `src/feed_watchdog.h`, run by `adsb_task`) targets
+one failure: the internal heap fragmenting until TLS can no longer allocate. It restarts the device
+when the feed has been stuck for 180 s (`ADSB_STUCK_MS`) with WiFi up **and** the largest
+free internal heap block is below `ADSB_STUCK_MIN_LARGEST_BLOCK` (28 KB). Any completed HTTP
+exchange (`AdsbClient::lastResponseMs()`, so a 403 counts) and WiFi being down refresh it. A poll
+the pacer skipped does **not**: fast TLS failures open the silence gaps above, the poll skips
+inside them, and counting those skips kept the restart from ever coming. A feed stuck for any
+other reason — every provider refusing us, or the internet down behind a working WiFi — keeps the
+radar running with the amber HUD warning instead of rebooting it every three minutes, but not
+forever: a backstop restarts the device regardless of the heap once WiFi has been up and no
+provider has answered for more than 30 minutes (`ADSB_STUCK_HARD_MS`). Any answer in that time
+resets the clock, so an outage that ends sooner never triggers it. The backstop's clock also
+stands still while **every** provider is parked by a refusal or `Retry-After`
+(`AdsbClient::allParked()`): that silence is our own, and the second 403 park (30 min) would
+otherwise end just after the backstop and reboot a refused device before it could knock again.
+`tests/feed_watchdog_test.cpp` drives the watchdog and the real pacer through these cases.
+
+Every HTTPS client sets `setHandshakeTimeout(TLS_HANDSHAKE_S)` (10 s). The core default is 120 s,
+so a server that accepts TCP but never finishes the handshake would hold the network task for two
+minutes, and two such hangs in a row outlast the 180 s watchdog with nothing wrong on the device.
+The JSON documents and the mbedTLS buffers themselves live in PSRAM (the PSRAM `JsonDocument`
+allocator in `adsb_client.cpp` and `mbedtls_platform_set_calloc_free()` in `main.cpp`), so TLS
+traffic cannot fragment the internal heap the handshake needs.
 
 Set the `User-Agent` with `HTTPClient::setUserAgent()`. **`addHeader("User-Agent", ...)` is
 silently ignored** — Arduino keeps that header on an internal "handled by code" list, so the
@@ -85,6 +118,9 @@ adsb.fi replies `Transfer-Encoding: chunked` (adsb.lol sends `Content-Length`), 
 this ArduinoJson reads the hex chunk-size line first, parses `4000` as a valid JSON number,
 and returns success with no `ac` key: a 200 that silently yields no aircraft. HTTP/1.0 has no
 chunked encoding, so the body is Content-Length- or close-delimited and streams correctly.
+The exception is adsb.lol, which now refuses HTTP/1.0 with `426 Upgrade Required` (its
+`istio-envoy` front end has Envoy's `accept_http_10` off, the default). It sends
+`Content-Length`, so it is asked in HTTP/1.1 (`http10` is per provider in `kProviders`).
 
 ### Not used: OpenSky
 Now requires OAuth2 client-credentials and has tighter anonymous limits — awkward for an always-on embedded device. Keep as a documented alternative only.

@@ -14,11 +14,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#if defined(ESP_PLATFORM)
-#include <TJpg_Decoder.h>
-#include <esp_heap_caps.h>
-#include "splash_jpg.h"
-#endif
+#include <vector>
 
 #define UI_GREEN lv_color_hex(0x1DFF86)
 #define UI_INK   lv_color_hex(0xEAFFF3)
@@ -61,7 +57,10 @@ static lv_obj_t *s_fcDayRain[3] = { nullptr, nullptr, nullptr };
 // 0 = Aviation (ft, kt, km) · 1 = Metric (m, km/h, km) · 2 = Imperial (ft, mph, mi).
 // The feed gives altitude in ft, speed in kt, vertical speed in fpm, distance in km.
 static int s_units = 0;
-void ui_set_units(int u) { s_units = (u < 0 || u > 2) ? 0 : u; }
+void ui_set_units(int u) {
+    s_units = (u < 0 || u > 2) ? 0 : u;
+    radar::setUnits(s_units);   // scope altitude labels (ft/m) follow the same preset
+}
 
 // Accessibility: "large text" swaps every font one-or-two steps up. The flag must be
 // set BEFORE ui_create() — fonts are baked into the widgets at creation time (the web
@@ -96,7 +95,8 @@ static float dist_val(float km) {
 static const char *dist_unit(void) { return s_units == 0 ? "nm" : (s_units == 2 ? "mi" : "km"); }
 
 static float weather_temp(float c) { return s_units == 2 ? c * 1.8f + 32.0f : c; }
-static const char *weather_temp_unit(void) { return s_units == 2 ? "F" : "C"; }
+// "\xC2\xB0" is the UTF-8 degree sign; LVGL's built-in Montserrat fonts carry it (U+00B0).
+static const char *weather_temp_unit(void) { return s_units == 2 ? "\xC2\xB0" "F" : "\xC2\xB0" "C"; }
 static float weather_wind(float kmh) {
     if (s_units == 0) return kmh * 0.539957f;
     if (s_units == 2) return kmh * 0.621371f;
@@ -142,13 +142,17 @@ static void fold_ascii(char *s) {
 }
 
 // ----------------------------------------------------------------- detail card
+// Idle clock up (radar_view scene step >= 1): the HUD, zoom button and card make way for it.
+static bool s_clockUp = false;
+
 static void refresh_card(void) {
     AcInfo in;
-    if (!radar::selected(in)) {
+    const bool sel = radar::selected(in);
+    if (s_clockUp || !sel) {
         lv_obj_add_flag(s_card, LV_OBJ_FLAG_HIDDEN);
         if (s_photo)       lv_obj_add_flag(s_photo, LV_OBJ_FLAG_HIDDEN);
         if (s_photoCredit) lv_obj_add_flag(s_photoCredit, LV_OBJ_FLAG_HIDDEN);
-        s_lastRouteReq[0] = 0;
+        if (!sel) s_lastRouteReq[0] = 0;
         return;
     }
     lv_obj_clear_flag(s_card, LV_OBJ_FLAG_HIDDEN);
@@ -160,16 +164,20 @@ static void refresh_card(void) {
     lv_label_set_text(s_cardTitle, title);
     lv_obj_set_style_text_color(s_cardTitle, in.emergency ? UI_EMERG : UI_INK, 0);
 
-    char altS[16], vsS[24], spdS[16], sqS[16];
+    char altS[16], vsS[24], spdS[16], sqS[16], hdgS[8];
     fmt_alt(altS, sizeof(altS), in.altFt, in.onGround);
     fmt_vs (vsS,  sizeof(vsS),  in.vsFpm);
     fmt_spd(spdS, sizeof(spdS), in.gsKt);
     if (in.squawk < 0)          snprintf(sqS, sizeof(sqS), "-");
     else                        snprintf(sqS, sizeof(sqS), "%04d", in.squawk);
+    // HDG is the aircraft's own ground track (what rotates the glyph), not the bearing
+    // from home — NaN (unknown) prints as "-".
+    if (in.track != in.track)   snprintf(hdgS, sizeof(hdgS), "-");
+    else                        snprintf(hdgS, sizeof(hdgS), "%03.0f", in.track);
 
     char left[96], right[96];
     snprintf(left,  sizeof(left),  "ALT  %s\nSPD  %s\nDIST %.1f %s", altS, spdS, dist_val(in.distKm), dist_unit());
-    snprintf(right, sizeof(right), "V/S  %s\nHDG  %03.0f\nSQK  %s", vsS, in.bearingDeg, sqS);
+    snprintf(right, sizeof(right), "V/S  %s\nHDG  %s\nSQK  %s", vsS, hdgS, sqS);
     lv_label_set_text(s_cardL, left);
     lv_label_set_text(s_cardR, right);
 
@@ -224,11 +232,90 @@ static void refresh_card(void) {
 }
 
 // --------------------------------------------------------------------- input
-static bool s_longPressed = false;
+static bool s_themeHeld = false;   // this press reached the theme hold: its lift is not a tap
 static int s_rangeIdx = -1;
 static float s_rangeKm = RANGE_KM_DEFAULT;   // current display range (km), for the stats view
 static void (*s_rangeCb)(float) = nullptr;
 static lv_obj_t *s_zoomBtn = nullptr, *s_zoomLbl = nullptr;
+static lv_obj_t *s_offBtn = nullptr, *s_offLbl = nullptr, *s_offRing = nullptr;
+static void (*s_poweroffCb)(void) = nullptr;
+static uint32_t s_offT0 = 0;
+static bool s_offFired = false;
+static lv_timer_t *s_offRestoreTimer = nullptr;
+
+// The button exists only on boards that can actually power off: it stays hidden until a
+// non-null callback is registered (null hides it again).
+void ui_set_poweroff_cb(void (*cb)(void)) {
+    s_poweroffCb = cb;
+    if (!s_offBtn) return;
+    if (cb) lv_obj_clear_flag(s_offBtn, LV_OBJ_FLAG_HIDDEN);
+    else   lv_obj_add_flag(s_offBtn, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Power off needs a 1.5 s HOLD so a swipe or stray tap can't turn the radar off.
+#define POWEROFF_HOLD_MS 1500
+// If the radar is still running a few seconds after "Powering off", the shutdown didn't
+// happen (e.g. the PMIC refused): go back to the hold prompt so the user isn't stuck.
+#define POWEROFF_RESTORE_MS 5000
+static void poweroff_restore_cb(lv_timer_t *t) {
+    s_offRestoreTimer = nullptr;
+    lv_timer_del(t);
+    s_offFired = false;
+    if (s_offLbl) lv_label_set_text(s_offLbl, LV_SYMBOL_POWER " Hold to power off");
+    if (s_offRing) lv_arc_set_end_angle(s_offRing, 0);
+}
+
+// Hold progress: the finger covers the button label, so a ring round the screen edge fills
+// clockwise from 12 o'clock over the hold and unwinds if the finger lifts early.
+#define POWEROFF_UNWIND_MS 400   // a full ring unwinds in this long (a partial one, pro rata)
+// The ring is never hidden, just set to zero length: showing or hiding a full-screen object
+// repaints the whole screen (~200 ms), while an angle change repaints only the changed part.
+static void off_ring_set(int32_t deg) {
+    if (!s_offRing) return;
+    lv_arc_set_end_angle(s_offRing, (uint16_t)(deg <= 0 ? 0 : deg > 360 ? 360 : deg));
+}
+static void off_ring_anim_cb(void *var, int32_t v) { (void)var; off_ring_set(v); }
+static int32_t off_ring_deg() {
+    if (!s_offRing) return 0;
+    return lv_arc_get_angle_end(s_offRing);
+}
+static void off_ring_unwind() {
+    const int32_t deg = off_ring_deg();
+    if (deg <= 0) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_offRing);
+    lv_anim_set_exec_cb(&a, off_ring_anim_cb);
+    lv_anim_set_values(&a, deg, 0);
+    lv_anim_set_time(&a, (uint32_t)(POWEROFF_UNWIND_MS * deg / 360));
+    lv_anim_start(&a);
+}
+
+static void poweroff_cb(lv_event_t *e) {
+    const lv_event_code_t c = lv_event_get_code(e);
+    if (!s_offLbl) return;
+    if (c == LV_EVENT_PRESSED) {
+        if (s_offRestoreTimer) { lv_timer_del(s_offRestoreTimer); s_offRestoreTimer = nullptr; }
+        // Pressed again mid-unwind: carry on from where the ring is instead of from empty.
+        const int32_t deg = off_ring_deg();
+        lv_anim_del(s_offRing, off_ring_anim_cb);
+        s_offT0 = lv_tick_get() - (uint32_t)(POWEROFF_HOLD_MS * deg / 360); s_offFired = false;
+        lv_label_set_text(s_offLbl, "Keep holding...");
+    } else if (c == LV_EVENT_PRESSING && !s_offFired) {
+        const uint32_t held = lv_tick_elaps(s_offT0);
+        off_ring_set((int32_t)(360 * held / POWEROFF_HOLD_MS));
+        if (held >= POWEROFF_HOLD_MS) {
+            s_offFired = true;
+            lv_label_set_text(s_offLbl, "Powering off");
+            if (s_poweroffCb) s_poweroffCb();
+            s_offRestoreTimer = lv_timer_create(poweroff_restore_cb, POWEROFF_RESTORE_MS, nullptr);
+            lv_timer_set_repeat_count(s_offRestoreTimer, 1);
+        }
+    } else if ((c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) && !s_offFired) {
+        lv_label_set_text(s_offLbl, LV_SYMBOL_POWER " Hold to power off");
+        off_ring_unwind();
+    }
+}
 
 void ui_set_range_cb(void (*cb)(float)) { s_rangeCb = cb; }
 
@@ -257,31 +344,90 @@ void ui_set_range_km(float km) {
     s_rangeIdx = best;
 }
 
-static void radar_press_cb(lv_event_t *e) { (void)e; s_longPressed = false; }
+// A still hold on the radar cycles the visual theme, on lift. When UI_THEME_HOLD_MS have
+// passed, a hint says "Lift to change theme"; moving the finger then cancels. Cycling on lift
+// (not when the time passes) keeps a press that turns into a swipe from changing the theme.
+// LVGL's own long press (400 ms) is not used: firm taps reached it, so tapping off a plane
+// card with a half-second press changed the theme and left the card open.
+static bool s_lpArmed = false;      // hold time passed, finger still down and still
+static bool s_lpMoved = false;      // finger travelled past the drag threshold since the press
+static lv_point_t s_lpOrigin;
+static uint32_t s_lpT0 = 0;         // when the press began (LVGL tick)
+static lv_obj_t *s_holdHint = nullptr;   // "Lift to change theme", shown while a hold is armed
+// Finger travel that counts as a drag. 10 px (LVGL's scroll limit) is under 1 mm on these
+// panels, less than a still fingertip drifts: on a 1.43, 3 of 15 holds were cancelled at
+// 12-14 px (@h0verin, #36). A real swipe across tiles still cancels through PRESS_LOST.
+#define LP_MOVE_PX 25
 
-static void radar_longpress_cb(lv_event_t *e) {   // long-press cycles the visual theme
+static void hold_hint_show(bool on) {
+    if (!s_holdHint) return;
+    if (on) lv_obj_clear_flag(s_holdHint, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(s_holdHint, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void radar_press_cb(lv_event_t *e) {
+    s_themeHeld = false;
+    s_lpArmed = false;
+    s_lpMoved = false;
+    s_lpT0 = lv_tick_get();
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (indev) lv_indev_get_point(indev, &s_lpOrigin);
+}
+
+static void radar_pressing_cb(lv_event_t *e) {
+    if (s_lpMoved) return;
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (!indev) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    const long dx = (long)p.x - s_lpOrigin.x, dy = (long)p.y - s_lpOrigin.y;
+    if (dx * dx + dy * dy > (long)LP_MOVE_PX * LP_MOVE_PX) {   // a drag: no theme change
+        s_lpMoved = true;
+        if (s_lpArmed) { s_lpArmed = false; hold_hint_show(false); }
+        return;
+    }
+    if (!s_lpArmed && lv_tick_elaps(s_lpT0) >= UI_THEME_HOLD_MS) {
+        s_lpArmed = true;
+        s_themeHeld = true;
+        hold_hint_show(true);
+    }
+}
+
+static void radar_release_cb(lv_event_t *e) {   // still finger lifted after the hold -> next theme
     (void)e;
-    radar::cycleTheme();
-    s_longPressed = true;
+    if (s_lpArmed && !s_lpMoved) {
+        hold_hint_show(false);
+        radar::cycleTheme();
+    }
+    s_lpArmed = false;
+}
+
+static void radar_presslost_cb(lv_event_t *e) {   // scroll stole the press: a swipe, not a hold
+    (void)e;
+    if (s_lpArmed) hold_hint_show(false);
+    s_lpArmed = false;
+}
+
+// A tap just outside the open card closes it, even on a plane: a finger aimed at the X or the
+// card's edge often lands a few px past the card, and that tap picked a plane instead. A second
+// tap picks the plane. Only taps that reach the radar tile come here: the zoom button keeps its own.
+static bool near_open_card(const lv_point_t &p) {
+    if (!s_card || lv_obj_has_flag(s_card, LV_OBJ_FLAG_HIDDEN)) return false;
+    lv_area_t a;
+    lv_obj_get_coords(s_card, &a);
+    const lv_coord_t m = UI_CARD_CLOSE_MARGIN;
+    return p.x >= a.x1 - m && p.x <= a.x2 + m && p.y >= a.y1 - m && p.y <= a.y2 + m;
 }
 
 static void radar_clicked_cb(lv_event_t *e) {
     (void)e;
-    if (s_longPressed) { s_longPressed = false; return; }   // ignore the click after a long-press
+    if (s_themeHeld) { s_themeHeld = false; return; }   // the lift after a theme hold is not a tap
     lv_indev_t *indev = lv_indev_get_act();
     if (!indev) return;
     lv_point_t p;
     lv_indev_get_point(indev, &p);
-    radar::select(radar::hitTest(p.x, p.y));   // hit -> select; miss -> clear
+    radar::select(near_open_card(p) ? -1 : radar::hitTest(p.x, p.y));   // hit -> select; miss or next to the card -> clear
     refresh_card();
-}
-
-static void list_btn_cb(lv_event_t *e) {
-    lv_obj_t *b = lv_event_get_target(e);
-    const int idx = (int)(intptr_t)lv_obj_get_user_data(b);
-    radar::select(idx);
-    refresh_card();
-    lv_obj_set_tile_id(s_tv, 0, 0, LV_ANIM_ON);   // jump back to the radar
 }
 
 // ----------------------------------------------------------------- list/stats
@@ -324,6 +470,18 @@ void ui_set_netinfo(const char *line) {
     if (s_statsNet && line) lv_label_set_text(s_statsNet, line);
 }
 
+// Which provider served the last aircraft data. Shown on the Stats view so users can tell
+// whether they are on airplanes.live (feeder households) or a fallback — until now that
+// was only visible on the serial log, and it kept coming up in support threads.
+static char s_feedHost[40] = "-";
+void ui_set_feed_source(const char *host) {
+    if (!host || !host[0] || host[0] == '?') { snprintf(s_feedHost, sizeof(s_feedHost), "-"); return; }
+    // strip the machine prefixes so the label reads like the project name users know
+    if      (strncmp(host, "api.",      4) == 0) host += 4;
+    else if (strncmp(host, "opendata.", 9) == 0) host += 9;
+    snprintf(s_feedHost, sizeof(s_feedHost), "%s", host);
+}
+
 // GPS indicator. state: 0 = off / no module (hidden), 1 = acquiring (amber), 2 = fix (green).
 void ui_set_gps(int state, int sats, float altM) {
     if (state <= 0) {                                 // hidden when GPS auto-location is off
@@ -354,11 +512,71 @@ void ui_set_gps(int state, int sats, float altM) {
     }
 }
 
-// Rebuild the scrollable contact list. Costly (deletes+recreates LVGL buttons), so we
-// only call it when the list tile is actually visible — not on every 2 s poll.
+// Refresh the scrollable contact list. Rows are updated in place and only added/removed
+// at the end: recreating every row (the old lv_obj_clean) reset the scroll to the top on
+// every poll and deleted the row under a pressing finger, eating taps.
+// A row is a plain full-width label and taps are hit-tested on the list itself: a
+// button-style row (lv_list_add_btn + per-row events/styles/user_data) costs ~0.7 KB of
+// LVGL's 64 KB pool and exhausts it when the list shows the full feed (60 aircraft).
+static std::vector<lv_obj_t *> s_listRows;
+// Whether each row currently carries s_rowEmgStyle. lv_obj_add_style() does not
+// de-duplicate and the per-object style count is a 6-bit field: re-adding the style on
+// every poll would overflow it after 64 refreshes and crash the radar. Touch the style
+// only when a row's emergency state changes.
+static std::vector<bool> s_listRowEmg;
+// Shared styles (one copy each, not per-row local styles that cost pool memory per row).
+// s_rowStyle reproduces the old lv_list button look: full width, a row every 42 px with
+// F16, a 1 px separator underneath in the default theme's grey.
+static lv_style_t s_rowStyle, s_rowEmgStyle;
+static bool s_rowStylesInit = false;
+
+// Taps land on the list container (rows are not clickable); map the point to a row.
+// The aircraft is picked at touch-down, by hex: build_list rewrites rows in place on every
+// poll, so mapping the row only at release could open a different plane if a poll landed
+// between press and release.
+static char s_listPressHex[sizeof(AcInfo::hex)];
+
+static void list_press_cb(lv_event_t *e) {
+    (void)e;
+    s_listPressHex[0] = '\0';
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    lv_area_t la, a;
+    lv_obj_get_coords(s_list, &la);
+    if (p.x < la.x1 || p.x > la.x2) return;
+    for (size_t i = 0; i < s_listRows.size(); ++i) {
+        lv_obj_get_coords(s_listRows[i], &a);
+        if (p.y >= a.y1 && p.y <= a.y2 + 2) {     // +2 swallows the 2 px row gap
+            AcInfo in;                              // row i shows radar::info(i) (build_list)
+            if (radar::info((int)i, in)) snprintf(s_listPressHex, sizeof(s_listPressHex), "%s", in.hex);
+            return;
+        }
+    }
+}
+
+static void list_tap_cb(lv_event_t *e) {
+    (void)e;
+    if (!s_listPressHex[0] || !radar::selectHex(s_listPressHex)) return;   // left the feed mid-press
+    refresh_card();
+    lv_obj_set_tile_id(s_tv, 0, 0, LV_ANIM_ON);   // jump back to the radar
+}
+
 static void build_list(void) {
     if (!s_list) return;
-    lv_obj_clean(s_list);
+    if (!s_rowStylesInit) {
+        lv_style_init(&s_rowStyle);
+        lv_style_set_width(&s_rowStyle, lv_pct(100));
+        lv_style_set_pad_hor(&s_rowStyle, 13);
+        lv_style_set_pad_ver(&s_rowStyle, 10);
+        lv_style_set_border_side(&s_rowStyle, LV_BORDER_SIDE_BOTTOM);
+        lv_style_set_border_width(&s_rowStyle, 1);
+        lv_style_set_border_color(&s_rowStyle, lv_color_hex(0xE0E0E0));
+        lv_style_init(&s_rowEmgStyle);   // emergency rows only: red text (the rest inherits)
+        lv_style_set_text_color(&s_rowEmgStyle, UI_EMERG);
+        s_rowStylesInit = true;
+    }
     const int n = radar::count();
     for (int i = 0; i < n; ++i) {
         AcInfo in;
@@ -367,12 +585,30 @@ static void build_list(void) {
         fmt_alt(altS, sizeof(altS), in.altFt, in.onGround);
         snprintf(txt, sizeof(txt), "%-8.8s  %-8s %4.1f %s",
                  in.call[0] ? in.call : in.hex, altS, dist_val(in.distKm), dist_unit());
-        lv_obj_t *b = lv_list_add_btn(s_list, NULL, txt);
-        lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_text_color(b, in.emergency ? UI_EMERG : UI_SOFT, 0);
-        lv_obj_set_style_text_font(b, F16(), 0);
-        lv_obj_set_user_data(b, (void *)(intptr_t)i);
-        lv_obj_add_event_cb(b, list_btn_cb, LV_EVENT_CLICKED, NULL);
+        if (i < (int)s_listRows.size()) {          // existing row: just refresh its content
+            lv_obj_t *l = s_listRows[i];
+            lv_label_set_text(l, txt);
+            if (s_listRowEmg[i] != in.emergency) {
+                if (in.emergency) lv_obj_add_style(l, &s_rowEmgStyle, 0);
+                else              lv_obj_remove_style(l, &s_rowEmgStyle, 0);
+                s_listRowEmg[i] = in.emergency;
+            }
+        } else {                                   // new row: append at the end
+            lv_obj_t *l = lv_label_create(s_list);
+            lv_obj_add_style(l, &s_rowStyle, 0);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);   // fixed width: a long line ends in '...'
+            lv_label_set_text(l, txt);
+            if (in.emergency) lv_obj_add_style(l, &s_rowEmgStyle, 0);
+            s_listRows.push_back(l);
+            s_listRowEmg.push_back(in.emergency);
+        }
+    }
+    // Surplus rows go from the end — safe mid-press: the press lives on the list container,
+    // and list_press_cb already took the pressed plane's hex, not a row pointer.
+    for (int i = (int)s_listRows.size() - 1; i >= n; --i) {
+        lv_obj_del(s_listRows[i]);
+        s_listRows.erase(s_listRows.begin() + i);
+        s_listRowEmg.erase(s_listRowEmg.begin() + i);
     }
 }
 
@@ -391,16 +627,17 @@ static void build_stats(void) {
     }
     char altH[16];
     fmt_alt(altH, sizeof(altH), (highest > -1e8f) ? highest : 0.0f, false);
-    char st[220];
+    char st[260];
     snprintf(st, sizeof(st),
              "Aircraft   %d\n"
              "Emergency  %d\n"
              "Nearest    %s\n"
              "           %.1f %s\n"
              "Highest    %s\n"
-             "Range      %.0f %s",
+             "Range      %.0f %s\n"
+             "Feed       %s",
              n, emg, n ? nearestCall : "-", dist_val(n ? nearest : 0.0f), dist_unit(),
-             altH, dist_val(s_rangeKm), dist_unit());
+             altH, dist_val(s_rangeKm), dist_unit(), s_feedHost);
     lv_label_set_text(s_statsLbl, st);
 }
 
@@ -561,6 +798,53 @@ void ui_set_weather_forecast(bool forecast) {
 static void (*s_viewChangedCb)(int) = nullptr;
 void ui_set_view_changed_cb(void (*cb)(int idx)) { s_viewChangedCb = cb; }
 
+// ---------------------------------------------------------------- idle clock
+// radar_view's scene steps. From the first one the HUD, the zoom button and the card make
+// way for the dial, and a transparent layer on top takes the touch that wakes the radar, so
+// that touch does not also select a plane, swipe a view or change the theme. LVGL counts the
+// press as activity, which is what makes main.cpp send the clock away.
+static lv_obj_t *s_clockCatcher = nullptr;
+
+static void clock_stage_cb(int stage) {
+    const bool up = stage != 0;
+    if (up == s_clockUp) return;
+    s_clockUp = up;
+    lv_obj_t *chrome[] = { s_hudWifi, s_hudGps, s_hudCount, s_hudClock, s_hudBatt, s_hudDate, s_zoomBtn };
+    for (lv_obj_t *o : chrome) {
+        if (!o) continue;
+        if (up) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    refresh_card();                         // hides the card while the clock is up, restores it after
+    if (!s_clockCatcher) return;
+    if (up) lv_obj_clear_flag(s_clockCatcher, LV_OBJ_FLAG_HIDDEN);
+    else if (!lv_obj_has_state(s_clockCatcher, LV_STATE_PRESSED))
+        lv_obj_add_flag(s_clockCatcher, LV_OBJ_FLAG_HIDDEN);   // still pressed: hidden on release
+}
+
+static void clock_catcher_release_cb(lv_event_t *e) {
+    if (!s_clockUp) lv_obj_add_flag(lv_event_get_target(e), LV_OBJ_FLAG_HIDDEN);
+}
+
+// Sweep compositor hooks (polled by display.cpp every loop pass).
+bool ui_sweep_visible(void) {
+    return s_tv && lv_tileview_get_tile_act(s_tv) == s_tileRadar && !lv_obj_is_scrolling(s_tv);
+}
+
+int ui_sweep_masks(int16_t out[][5], int max) {
+    lv_obj_t *objs[5] = { s_card, s_photo, s_photoCredit, s_zoomBtn, s_holdHint };   // detail card, its photo, range button, hold hint
+    int n = 0;
+    for (lv_obj_t *o : objs) {
+        if (n >= max || !o || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) continue;
+        lv_area_t a;
+        lv_obj_get_coords(o, &a);
+        out[n][0] = a.x1; out[n][1] = a.y1; out[n][2] = a.x2; out[n][3] = a.y2;
+        out[n][4] = lv_obj_get_style_radius(o, LV_PART_MAIN);
+        n++;
+    }
+    return n;
+}
+
 static int active_view_index(void) {
     if (!s_tv) return 0;
     lv_obj_t *act = lv_tileview_get_tile_act(s_tv);
@@ -615,6 +899,14 @@ static lv_obj_t *make_round_panel(lv_obj_t *parent) {
     return p;
 }
 
+// The X in the card's top-right corner: closes the card, as a tap on empty scope does. With
+// planes round the card, that tap often selected one of them instead.
+static void card_close_cb(lv_event_t *e) {
+    (void)e;
+    radar::select(-1);
+    refresh_card();
+}
+
 static void build_card(void) {
     s_card = lv_obj_create(s_tileRadar);
     lv_obj_remove_style_all(s_card);
@@ -650,7 +942,35 @@ static void build_card(void) {
     s_cardRoute = lv_label_create(s_card);
     lv_obj_set_style_text_font(s_cardRoute, F14(), 0);
     lv_obj_set_style_text_color(s_cardRoute, UI_GREEN, 0);
+    // fill the card width and dot out long "Origin -> Destination" instead of clipping
+    lv_obj_set_width(s_cardRoute, s_bigText ? 292 : 276);   // card 316/300 minus pad 12 x2
+    lv_label_set_long_mode(s_cardRoute, LV_LABEL_LONG_DOT);
     lv_obj_align(s_cardRoute, LV_ALIGN_TOP_LEFT, 0, s_bigText ? 100 : 76);
+
+    // The X sits in the card's top-right corner, 4 px in from its edges (the content area
+    // starts 13 px in: 12 px padding plus the 1 px frame). A child of the card: it hides with
+    // it, and the card's sweep mask covers it.
+    // Its tap area grows by UI_CARD_CLOSE_HIT on every side; LVGL clips that to the card.
+    const lv_coord_t cs = s_bigText ? 32 : 28;
+    lv_obj_t *x = lv_obj_create(s_card);
+    lv_obj_remove_style_all(x);
+    lv_obj_set_size(x, cs, cs);
+    lv_obj_align(x, LV_ALIGN_TOP_RIGHT, 9, -9);
+    lv_obj_set_style_radius(x, 10, 0);                        // the card's 14 minus the 4 px inset
+    lv_obj_set_style_border_color(x, UI_GREEN, 0);            // the card's own frame
+    lv_obj_set_style_border_opa(x, 90, 0);
+    lv_obj_set_style_border_width(x, 1, 0);
+    lv_obj_set_style_bg_color(x, UI_GREEN, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(x, 60, LV_STATE_PRESSED);
+    lv_obj_add_flag(x, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(x, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);   // a small drift must not swipe the view
+    lv_obj_set_ext_click_area(x, UI_CARD_CLOSE_HIT);
+    lv_obj_add_event_cb(x, card_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *xl = lv_label_create(x);
+    lv_label_set_text(xl, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(xl, F14(), 0);
+    lv_obj_set_style_text_color(xl, UI_SOFT, 0);
+    lv_obj_center(xl);
 
     // aircraft photo + credit, floating above the card (hidden until one loads)
     s_photo = lv_canvas_create(s_tileRadar);
@@ -821,7 +1141,9 @@ void ui_create(void) {
     lv_obj_add_flag(s_tileRadar, LV_OBJ_FLAG_CLICKABLE);     // receive taps (planes/empty)
     lv_obj_add_event_cb(s_tileRadar, radar_clicked_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(s_tileRadar, radar_press_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_tileRadar, radar_longpress_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(s_tileRadar, radar_pressing_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(s_tileRadar, radar_release_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_tileRadar, radar_presslost_cb, LV_EVENT_PRESS_LOST, NULL);
     build_card();
 
     // on-screen range/zoom button (reliable single tap; bottom, above the 'S' marker)
@@ -892,6 +1214,33 @@ void ui_create(void) {
     lv_label_set_text(s_hudDate, "");
     lv_obj_align(s_hudDate, LV_ALIGN_TOP_MID, 0, 70);
 
+    // The theme hold's hint (radar_pressing_cb), styled like the zoom button and centred like
+    // the detail card. Opaque: while it shows, it sits over the middle of an open card.
+    s_holdHint = lv_label_create(s_tileRadar);
+    lv_label_set_text(s_holdHint, "Lift to change theme");
+    lv_obj_set_style_text_font(s_holdHint, F14(), 0);
+    lv_obj_set_style_text_color(s_holdHint, UI_GREEN, 0);
+    lv_obj_set_style_bg_color(s_holdHint, UI_PANEL, 0);
+    lv_obj_set_style_bg_opa(s_holdHint, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_holdHint, UI_GREEN, 0);
+    lv_obj_set_style_border_width(s_holdHint, 1, 0);
+    lv_obj_set_style_border_opa(s_holdHint, 170, 0);
+    lv_obj_set_style_radius(s_holdHint, 18, 0);
+    lv_obj_set_style_pad_hor(s_holdHint, 18, 0);
+    lv_obj_set_style_pad_ver(s_holdHint, 13, 0);
+    lv_obj_align(s_holdHint, LV_ALIGN_CENTER, 0, s_bigText ? 56 : 66);
+    lv_obj_add_flag(s_holdHint, LV_OBJ_FLAG_HIDDEN);
+
+    // idle clock: a transparent layer above everything takes the touch that wakes the radar
+    s_clockCatcher = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_clockCatcher);
+    lv_obj_set_size(s_clockCatcher, SCREEN_W, SCREEN_H);
+    lv_obj_clear_flag(s_clockCatcher, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_flag(s_clockCatcher, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_clockCatcher, clock_catcher_release_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_clockCatcher, clock_catcher_release_cb, LV_EVENT_PRESS_LOST, NULL);
+    radar::setClockStageCb(clock_stage_cb);
+
     // --- list tile (circular panel, clipped to the round screen) ---
     lv_obj_t *lp = make_round_panel(s_tileList);
     make_tile_title(lp, "AIRCRAFT");
@@ -901,6 +1250,11 @@ void ui_create(void) {
     lv_obj_set_style_bg_opa(s_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_list, 0, 0);
     lv_obj_set_style_pad_row(s_list, 2, 0);
+    // rows are plain labels: they inherit font/colour from here (see build_list)
+    lv_obj_set_style_text_font(s_list, F16(), 0);
+    lv_obj_set_style_text_color(s_list, UI_SOFT, 0);
+    lv_obj_add_event_cb(s_list, list_press_cb, LV_EVENT_PRESSED, NULL);  // pick the plane at touch-down
+    lv_obj_add_event_cb(s_list, list_tap_cb, LV_EVENT_CLICKED, NULL);   // rows aren't clickable
 
     // --- stats tile (circular panel) ---
     lv_obj_t *sp = make_round_panel(s_tileStats);
@@ -926,6 +1280,42 @@ void ui_create(void) {
     lv_obj_set_style_text_align(s_statsNet, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(s_statsNet, "");
     lv_obj_align(s_statsNet, LV_ALIGN_CENTER, 0, 132);
+
+    // power off (hold) -- top of the Stats view, under the title
+    s_offBtn = lv_btn_create(sp);
+    lv_obj_set_size(s_offBtn, 210, 40);
+    lv_obj_set_ext_click_area(s_offBtn, 12);
+    lv_obj_align(s_offBtn, LV_ALIGN_CENTER, 0, -150);
+    lv_obj_set_style_radius(s_offBtn, 18, 0);
+    lv_obj_set_style_bg_color(s_offBtn, UI_PANEL, 0);
+    lv_obj_set_style_bg_opa(s_offBtn, 225, 0);
+    lv_obj_set_style_border_color(s_offBtn, UI_EMERG, 0);
+    lv_obj_set_style_border_width(s_offBtn, 1, 0);
+    lv_obj_clear_flag(s_offBtn, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_event_cb(s_offBtn, poweroff_cb, LV_EVENT_ALL, NULL);
+    s_offLbl = lv_label_create(s_offBtn);
+    lv_label_set_text(s_offLbl, LV_SYMBOL_POWER " Hold to power off");
+    lv_obj_set_style_text_font(s_offLbl, F14(), 0);
+    lv_obj_set_style_text_color(s_offLbl, UI_EMERG, 0);
+    lv_obj_center(s_offLbl);
+    lv_obj_add_flag(s_offBtn, LV_OBJ_FLAG_HIDDEN);   // shown only when ui_set_poweroff_cb(non-null)
+
+    // hold-progress ring round the screen edge (top layer, so it shows over the Stats tile)
+    s_offRing = lv_arc_create(lv_layer_top());
+    lv_obj_set_size(s_offRing, SCREEN_W, SCREEN_H);
+    lv_obj_center(s_offRing);
+    lv_obj_remove_style(s_offRing, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(s_offRing, LV_OBJ_FLAG_CLICKABLE);
+    lv_arc_set_rotation(s_offRing, 270);              // 0 degrees = 12 o'clock
+    lv_arc_set_bg_angles(s_offRing, 0, 360);
+    lv_arc_set_angles(s_offRing, 0, 0);
+    lv_obj_set_style_arc_opa(s_offRing, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_offRing, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_offRing, 0, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_offRing, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_offRing, UI_EMERG, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_offRing, false, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(s_offRing, 0, 0);
 
     lv_obj_t *ver = lv_label_create(sp);            // firmware version (so users can tell what's flashed)
     lv_obj_set_style_text_font(ver, F12(), 0);

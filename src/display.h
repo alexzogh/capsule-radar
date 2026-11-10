@@ -13,7 +13,9 @@ bool begin();
 // Pump LVGL: render dirty areas + run LVGL timers. Call every loop() iteration.
 void loop();
 
-// 0..255 panel brightness (CO5300 command 0x51).
+// 0..255 panel brightness (CO5300 command 0x51). 0 = dark (face-down sleep): a touch then
+// only wakes the screen, and a press that starts while it is dark never reaches LVGL, up to
+// its lift (TouchQueue::setWakeOnly).
 void setBrightness(uint8_t v);
 
 // ms since the last touch (LVGL inactivity timer) — for idle auto-dim.
@@ -25,6 +27,16 @@ uint32_t inactiveMs();
 // is transformed back into the same logical coordinate space.
 void setRotation(uint16_t degrees);
 uint16_t rotation();
+
+// Sweep compositor: draws the radar sweep (and the centre ripple) per pixel over the last
+// pushed frame, so LVGL no longer repaints the whole layer stack under them on every tick.
+// It also draws the idle clock's hands (radar::clockFrame()), which must move at its rate.
+// radar_view hands over colours + on/off (main.cpp wires it); the UI is polled for
+// visibility and the objects the sweep must not cover.
+bool sweepAvailable();          // buffers allocated: the compositor can own the sweep
+void sweepConfig(uint16_t ring565, uint16_t lead565, uint16_t ink565, bool sweep, bool pulse);
+void sweepTick();               // advance the sweep if a tick is due; no LVGL, no I2C (safe inside the GPS drain)
+float sweepAngleDeg();          // where the sweep line is now: degrees, 0 = up (logical), clockwise
 
 } // namespace display
 

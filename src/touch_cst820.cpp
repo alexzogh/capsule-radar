@@ -50,11 +50,11 @@ bool touch_begin() {
     return true;
 }
 
-bool touch_read(uint16_t *ox, uint16_t *oy) {
+TouchRead touch_read(uint16_t *ox, uint16_t *oy) {
     uint8_t d[6];
-    if (!cst_read(CST820_REG_DATA, d, 6)) return false;
+    if (!cst_read(CST820_REG_DATA, d, 6)) return TOUCH_NODATA;
     const uint8_t points = d[1];
-    if (points == 0) return false;
+    if (points == 0) return TOUCH_UP;
 
     uint16_t x = (uint16_t)(((d[2] & 0x0F) << 8) | d[3]);
     uint16_t y = (uint16_t)(((d[4] & 0x0F) << 8) | d[5]);
@@ -66,7 +66,7 @@ bool touch_read(uint16_t *ox, uint16_t *oy) {
 
     *ox = x;
     *oy = y;
-    return true;
+    return TOUCH_DOWN;
 }
 
 #endif  // BOARD_LCD21

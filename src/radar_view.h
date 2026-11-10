@@ -1,8 +1,10 @@
 #pragma once
 // Scope rendering API (M1 scope, M2 aircraft, M3 selection). See docs/ARCHITECTURE.md.
 // Visual reference: assets/plane_radar_2.0_mockup.html
+#include <stdint.h>
 #include <vector>
 #include "aircraft.h"
+#include "clock_face.h"
 
 struct RadarSettings {
     double homeLat, homeLon;
@@ -30,7 +32,8 @@ struct AcInfo {
     float vsFpm;        // NaN if unknown
     float gsKt;         // NaN if unknown
     float distKm;
-    float bearingDeg;
+    float bearingDeg;   // bearing from home (deg)
+    float track;        // ground track deg (NaN if unknown) — the heading the glyph points
     int   squawk;       // -1 if unknown
     bool  emergency;
 };
@@ -48,6 +51,9 @@ int  hitTest(int x, int y);
 
 // Selection (tracked by hex so it survives data updates). idx < 0 clears.
 void select(int idx);
+// Select by hex: the list captures it at touch-down, because polls rewrite its rows in
+// place. False (selection unchanged) when that aircraft has left the feed.
+bool selectHex(const char* hex);
 bool selected(AcInfo& out);                 // false if nothing selected/visible
 
 // Tracking: tap a selected aircraft a second time to lock the scope on it.
@@ -70,11 +76,30 @@ void cycleTheme();
 void setThemeChangedCb(void (*cb)(int theme));   // called when the theme changes (for persistence)
 void setRangeLabelVisible(bool v);               // hide the built-in range label (UI shows its own)
 void setSweepEnabled(bool on);                   // show/hide the rotating sweep line
+// Hand the sweep to a per-pixel compositor (device: display.cpp). config gets the theme's
+// ring/lead colours (RGB565) and whether a sweep should show; tick is called during long
+// rebuilds so the sweep keeps moving; angle returns where its sweep line is (degrees,
+// 0 = up), so the idle clock can start from it. Without it, LVGL draws the sweep.
+void setSweepCompositor(void (*config)(uint16_t ring565, uint16_t lead565, uint16_t ink565, bool sweep, bool pulse),
+                        void (*tick)(), float (*angle)());
 bool sweepEnabled();
 void setAirportsEnabled(bool on);                // show/hide airport markers on the scope
 bool airportsEnabled();
 void setTrailLength(int level);                  // 0=off 1=short 2=medium 3=long (aircraft trails + flow)
 void setMaxOnScreen(int n);                       // how many (nearest) aircraft to draw on the scope
 void setLargeText(bool on);                       // accessibility: bigger glyph labels. Call BEFORE init()
+void setUnits(int preset);                       // 0 = feet · 1 = metres (scope altitude labels; same presets as ui_set_units)
+
+// Idle clock (clock_face.h): the radar turns into an analog clock and back.
+// setClock(true) starts the radar -> clock animation, setClock(false) the way back. It
+// returns false when the clock cannot start: the time is unknown, or the clock is still
+// animating away (ask again).
+bool  setClock(bool on);
+bool  clockRequested();                     // entering or shown
+float clockProgress();                      // 0 = radar ... 1 = clock, animated (brightness ramp)
+bool  clockFrame(ClockFrame& out);          // compositor: the frame now; false when the clock is off
+bool  emergencyInRange();                   // an in-range aircraft squawks 7500/7600/7700
+void  setClockTimeSource(bool (*fn)(ClockHands& out));   // default: the system's local time
+void  setClockStageCb(void (*cb)(int stage));            // scene step changed (ClockFrame::stage)
 
 } // namespace radar
