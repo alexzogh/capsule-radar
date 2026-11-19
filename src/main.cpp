@@ -29,7 +29,7 @@
 #include "battery.h"                 // AXP2101 battery gauge
 #include "rtc_pcf85063.h"            // PCF85063 RTC (offline clock + date)
 #include "audio.h"                   // ES8311 alert pings
-#include <set>                       // audio: track which contacts are in range
+#include "alert_memory.h"            // which aircraft the alerts have seen, and when
 #include <string>
 #include <WiFiManager.h>             // captive portal
 #include <Preferences.h>            // NVS (persist theme/settings)
@@ -65,7 +65,7 @@ static WiFiManager           g_wm;
 static int                   g_brightnessDay = BRIGHTNESS_DEFAULT;   // user brightness (web/NVS)
 static int                   g_volume = 60;                          // alert volume 0..100 (web/NVS)
 static bool                  g_muted  = false;                       // mute alert pings
-static int                   g_alertMode = 2;                        // 0=off 1=emergencies 2=new+emergencies (web/NVS)
+static int                   g_alertMode = 2;                        // 0=off 1=emergencies 2=new+emergencies 3=military+emergencies (web/NVS)
 static float                 g_proximityKm = 0.0f;                   // proximity alert radius, km (0=off) (web/NVS)
 static uint32_t              g_idleDimMs = IDLE_DIM_MS;              // dim after this idle time (0 = never)
 static bool                  g_fdSleep = true;                       // face-down sleep (screen off) on/off (web/NVS)
@@ -319,7 +319,7 @@ static void loadSettings() {
     g_brightnessDay    = constrain(p.getInt("bright", BRIGHTNESS_DEFAULT), 5, 255);
     g_volume           = p.getInt("vol", 60);
     g_muted            = p.getBool("mute", false);
-    g_alertMode        = p.getInt("alertmode", 2);
+    g_alertMode        = constrain(p.getInt("alertmode", 2), 0, 3);
     g_proximityKm      = p.getFloat("proxkm", 0.0f);
     g_useGps           = p.getBool("usegps", false);
     g_trailLen         = p.getInt("traillen", 2);
@@ -339,39 +339,64 @@ static void loadSettings() {
     radar::setLargeText(g_bigText);
 }
 
-// Audio alerts. g_alertMode: 0 = off, 1 = emergencies only, 2 = new aircraft + emergencies.
+// The alert memory's table (alert_memory.h) goes in PSRAM, so it never touches the internal
+// heap TLS needs; internal RAM only if PSRAM is short.
+void *alert_memory_calloc(size_t n, size_t size) {
+    return heap_caps_calloc_prefer(n, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+// Audio alerts. g_alertMode (values kept stable for NVS; the web list shows them in a
+// different order): 0 = off, 1 = emergency squawks only, 3 = new military aircraft +
+// emergencies, 2 = new aircraft + emergencies (military included).
 // g_proximityKm > 0 also pings (once) when any aircraft crosses into that radius.
+// "New" means not in range during the last ALERT_FORGET_MS (and "crosses into the radius"
+// likewise): an aircraft that drops out of the feed for a poll or two, such as a low
+// helicopter or one flying along the range edge, would otherwise ping every time it came back.
+// Pings follow what is DRAWN (radar::isShown: in range and among the nearest aircraft the
+// scope shows), so a beep always has a glyph to look at; one that is in range but not drawn
+// pings when it first appears. Emergency squawks in range are always drawn (past every cap).
+// An emergency squawk (7500/7600/7700) pings when the aircraft enters range squawking it, or
+// when one already in range starts squawking it; again only if it wasn't squawking one in the
+// last ALERT_EMERG_REPING_MS, so a squawk that flickers in the feed doesn't ping every poll.
 static void checkAudioEvents() {
     if (!audio_present()) return;
-    static std::set<std::string> seen, seenProx;
+    static AlertMemory seen, seenProx, squawked;
     static bool first = true;
     static uint32_t lastNew = 0;
-    std::set<std::string> now, nowProx;
+    if (!seen.ready() || !seenProx.ready() || !squawked.ready()) return;
+    const uint32_t nowMs = millis();
     for (const Aircraft &ac : g_snap) {
         const double d = geo::haversineKm(g_settings.homeLat, g_settings.homeLon, ac.lat, ac.lon);
         if (d > g_settings.rangeKm) continue;                 // in-range only
-        const std::string hex = ac.hex.c_str();
-        now.insert(hex);
-        const bool isNew     = !first && !seen.count(hex);
-        const bool emergency = acIsEmergency(ac.squawk) || ac.military;  // military: feed dbFlags
+        if (!radar::isShown(ac.hex.c_str())) continue;        // and drawn on the scope
+        const uint32_t id = acId(ac.hex.c_str());
+        const bool isNew     = !first && !seen.recent(id, nowMs, ALERT_FORGET_MS);
+        seen.touch(id, nowMs);
+        const bool squawk    = acIsEmergency(ac.squawk);                // ac.military: feed dbFlags
 
-        // proximity: fire once, when an aircraft first crosses into the radius (any aircraft)
-        if (g_proximityKm > 0.0f && d <= g_proximityKm) {
-            nowProx.insert(hex);
-            if (!first && !seenProx.count(hex)) audio_play(AUDIO_ALERT);
+        // emergency squawk: on entry or mid-flight, in any mode but off
+        if (squawk) {
+            if (!first && g_alertMode != 0 && !squawked.recent(id, nowMs, ALERT_EMERG_REPING_MS))
+                audio_play(AUDIO_EMERGENCY);                    // its own sound: three rising beeps
+            squawked.touch(id, nowMs);
         }
 
-        // new-in-range pings (on entry), gated by the alert mode
-        if (isNew) {
-            if (emergency) { if (g_alertMode >= 1) audio_play(AUDIO_ALERT); }   // emergencies only / +new
-            else if (g_alertMode >= 2 && millis() - lastNew > 3000) {
+        // proximity: fire once, when an aircraft first crosses into the radius (any drawn aircraft)
+        if (g_proximityKm > 0.0f && d <= g_proximityKm) {
+            if (!first && !seenProx.recent(id, nowMs, ALERT_FORGET_MS)) audio_play(AUDIO_ALERT);
+            seenProx.touch(id, nowMs);
+        }
+
+        // new pings (on first appearing on the scope), gated by the alert mode
+        if (isNew && !squawk) {                                           // squawks: above
+            if (ac.military) { if (g_alertMode >= 2) audio_play(AUDIO_ALERT); } // military: modes 2 and 3
+            else if (g_alertMode == 2 && nowMs - lastNew > 3000) {
                 audio_play(AUDIO_NEW);                                          // new contact (rate-limited)
-                lastNew = millis();
+                lastNew = nowMs;
             }
         }
     }
-    seen.swap(now);
-    seenProx.swap(nowProx);
     first = false;
 }
 
@@ -405,6 +430,11 @@ static void saveTheme(int t) {
     p.begin("capsuleradar", false);
     p.putInt("theme", t);
     p.end();
+}
+
+static void onThemeChanged(int t) {
+    saveTheme(t);
+    ui_apply_theme();   // range button follows the scope colour
 }
 
 // Convert a UTC broken-down time to time_t (mktime assumes local TZ, so flip to UTC0).
@@ -511,6 +541,12 @@ static bool refuseUnlessPageFetch() {
 #else
 #define VOL_HIDE ""
 #endif
+// With neither a codec nor a buzzer (the 1.43), every Sound control is a silent no-op: no card.
+#if BOARD_HAS_AUDIO || BOARD_HAS_BUZZER
+#define SOUND_HIDE ""
+#else
+#define SOUND_HIDE " hidden"
+#endif
 
 static void handleRoot() {
     const int th = radar::theme();
@@ -608,11 +644,14 @@ static void handleRoot() {
         snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", mv.ft, mv.ft == g_maxAltFt ? " selected" : "", mv.lbl);
         mbopts += o;
     }
-    const char *anames[] = {"Off", "Emergencies only", "New aircraft + emergencies"};
+    // Shown in this order; the values are the stored g_alertMode (3 was added later).
+    const struct { int v; const char *name; } amodes[] = {
+        {0, "Off"}, {1, "Emergencies only"}, {3, "New military aircraft + emergencies"},
+        {2, "New aircraft + emergencies"}};
     String aopts;
-    for (int i = 0; i < 3; ++i) {
-        char o[80];
-        snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", i, i == g_alertMode ? " selected" : "", anames[i]);
+    for (const auto &am : amodes) {
+        char o[96];
+        snprintf(o, sizeof(o), "<option value=%d%s>%s</option>", am.v, am.v == g_alertMode ? " selected" : "", am.name);
         aopts += o;
     }
     const int proxUnit[] = {0, 2, 5, 10, 25};   // 0 = off; rest in the user's distance unit
@@ -638,9 +677,10 @@ static void handleRoot() {
     if (gps_present()) {
         gpsRow  = "<label><input type=checkbox class=ck ";
         gpsRow += g_useGps ? "checked" : "";
-        gpsRow += " onchange='gp(this.checked)'>Use GPS for location</label>";
+        gpsRow += " onchange='gp(this.checked)'>Use GPS for location *</label>";
         gpsRow += "<div style='font-size:12px;opacity:.6;margin:-2px 0 6px'>"
-                  "When on, the location above is used until the GPS gets a fix, then it takes over.</div>";
+                  "When on, the location above is used until the GPS gets a fix, then it takes over.<br>"
+                  "* Applies immediately; Save &amp; restart not needed.</div>";
     }
     // 16 KB: the page outgrew 10 KB (~10.3 KB with the GPS row), and snprintf silently cut
     // off the closing </script>, so none of the live-setting handlers existed in the browser.
@@ -707,7 +747,7 @@ static void handleRoot() {
         "<input type=number min=0 max=359 step=1 value='%d' onchange='ro(this.value)'>"
         "<label>Units</label><select onchange='u(this.value)'>%s</select>"
         "<label>Weather temperature</label><select onchange='tu(this.value)'>%s</select></div>"
-        "<div class=card><div class=t>Sound</div>"
+        "<div class=card" SOUND_HIDE "><div class=t>Sound</div>"
         "<div" VOL_HIDE "><label>Volume</label>"
         "<input type=range min=0 max=100 value='%d' oninput='v(this.value,0)' onchange='v(this.value,1)'></div>"
         "<label><input type=checkbox class=ck %s onchange='m(this.checked)'>Mute alerts</label>"
@@ -716,7 +756,7 @@ static void handleRoot() {
         "<button type=button class=sec onclick='t()'>Test ping</button></div>"
         "<div class=card><div class=t>Network</div>"
         "<p style='color:#9affc8;font-size:13px;margin:0 0 4px'>Forget the saved WiFi and reopen the setup portal.</p>"
-        "<form method=POST action=/wifi><button class=w>Reset WiFi</button></form></div>"
+        "<form method=POST action=/wifi onsubmit=\"return confirm('Forget the saved WiFi and reopen the setup portal?')\"><button class=w>Reset WiFi</button></form></div>"
         "<p class=ft>Reach me at <code>capsuleradar.local</code> &middot; <a href=/update style='color:#9affc8'>Firmware update</a> &middot; v" FW_VERSION "</p>"
         "<script>"
         "var C=[%.5f,%.5f];var MAP=L.map('map').setView(C,10);"
@@ -727,10 +767,18 @@ static void handleRoot() {
         "MAP.on('click',function(e){MK.setLatLng(e.latlng);S(e.latlng);});"
         "setTimeout(function(){MAP.invalidateSize();},300);"
         "function G(p){fetch(p,{headers:{'" WEB_PAGE_HDR "':'1'}})}"
-        "function b(v,s){G('/bright?v='+v+(s?'&save=1':''))}"
-        "function v(x,s){G('/vol?v='+x+(s?'&save=1':''))}"
+        // A slider fires a request per step while it's dragged, and the server answers one at a
+        // time, so a fast drag could land out of order and leave an in-between value. SQ sends one
+        // request at a time per slider and keeps only the newest waiting one; the release value
+        // (with &save=1) comes last, so it is the one that sticks. Test ping waits for it.
+        "var Q={};"
+        "function SQ(k,p){if(Q[k]){Q[k].n=p;return}Q[k]={};"
+        "fetch(p,{headers:{'" WEB_PAGE_HDR "':'1'}}).catch(function(){}).then(function(){"
+        "var n=Q[k].n,f=Q[k].f;delete Q[k];if(n){SQ(k,n);Q[k].f=f}else if(f)f()})}"
+        "function b(v,s){SQ('b','/bright?v='+v+(s?'&save=1':''))}"
+        "function v(x,s){SQ('v','/vol?v='+x+(s?'&save=1':''))}"
         "function m(c){G('/vol?mute='+(c?1:0)+'&save=1')}"
-        "function t(){G('/vol?test=1')}"
+        "function t(){if(Q.v)Q.v.f=function(){G('/vol?test=1')};else G('/vol?test=1')}"
         "function d(v){G('/idle?v='+v+'&save=1')}"
         "function fd(c){G('/fdsleep?v='+(c?1:0)+'&save=1')}"
         "function sw(c){G('/sweep?v='+(c?1:0)+'&save=1')}"
@@ -817,8 +865,14 @@ static void handleSave() {
 static void handleWifi() {
     if (refuseIfCrossSite()) return;
     g_web.send(200, "text/html",
+        "<title>Capsule Radar - WiFi reset</title>"
         "<body style='background:#06100a;color:#ffb23c;font-family:sans-serif;padding:24px'>"
-        "WiFi reset. Connect to the <b>CapsuleRadar-Setup</b> network to reconfigure.</body>");
+        "WiFi reset. Join the <b>CapsuleRadar-Setup</b> WiFi network to set it up again; the setup "
+        "page usually opens by itself, or go to <a href=http://192.168.4.1/ style='color:#9affc8'>"
+        "192.168.4.1</a>. Once it's back on your network, the radar is at "
+        "<a href=http://capsuleradar.local/ style='color:#9affc8'>capsuleradar.local</a>."
+        // leave /wifi in the address bar and a later reload would send the reset again
+        "<script>history.replaceState(null,'','/')</script></body>");
     delay(400);                     // let the response reach the browser
     // The driver stores the saved AP in its own NVS namespace ("nvs.net80211"). On Arduino
     // core 3.x both wm.resetSettings() and WiFi.disconnect(true,true) can silently no-op
@@ -864,15 +918,18 @@ static void handleVol() {
         p.end();
     }
     if (g_web.hasArg("test")) {
-        if (g_web.arg("test").toInt() == 2) audio_selftest();   // long tone, ignores mute
-        else audio_play(AUDIO_NEW);
+        const int t = g_web.arg("test").toInt();
+        if (t == 2)      audio_selftest();              // long tone, ignores mute
+        else if (t == 3) audio_play(AUDIO_EMERGENCY);   // check the alert sounds by ear
+        else if (t == 4) audio_play(AUDIO_ALERT);
+        else             audio_play(AUDIO_NEW);
     }
     g_web.send(200, "text/plain", "ok");
 }
 
 static void handleAlerts() {   // what triggers the alert sound (live)
     if (refuseUnlessPageFetch()) return;
-    if (g_web.hasArg("mode")) g_alertMode   = constrain((int)g_web.arg("mode").toInt(), 0, 2);
+    if (g_web.hasArg("mode")) g_alertMode   = constrain((int)g_web.arg("mode").toInt(), 0, 3);
     if (g_web.hasArg("prox")) {
         g_proximityKm = g_web.arg("prox").toFloat();   // km (0 = off)
         g_requeryKm = queryRadiusKm();                 // the query must cover the new alert circle
@@ -1291,7 +1348,8 @@ void setup() {
         display::setRotation((uint16_t)g_rotation);
         g_rotation = display::rotation();
     }
-    radar::setThemeChangedCb(saveTheme);
+    radar::setThemeChangedCb(onThemeChanged);
+    ui_apply_theme();                            // the theme restored above
     ui_set_range_cb(onRangeChange);              // on-screen zoom button
     ui_set_units(g_units);                       // apply saved unit preset
     ui_set_temp_unit(g_tempUnit);                // and the weather temperature unit

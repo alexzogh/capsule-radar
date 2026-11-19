@@ -64,6 +64,7 @@ void clearTrack();
 // Snapshot access for the list / stats views.
 int  count();
 int  countInRange();                        // aircraft within the display range (for the HUD)
+bool isShown(const char *hex);              // is this aircraft drawn on the scope now? (alerts follow it)
 bool info(int idx, AcInfo& out);
 
 // Sweep self-animates via an internal timer; kept for API compatibility.
@@ -74,6 +75,7 @@ void setTheme(int theme);
 int  theme();
 void cycleTheme();
 void setThemeChangedCb(void (*cb)(int theme));   // called when the theme changes (for persistence)
+uint32_t accentRgb();                            // the active theme's ring colour, 0xRRGGBB (for UI chrome)
 void setRangeLabelVisible(bool v);               // hide the built-in range label (UI shows its own)
 void setSweepEnabled(bool on);                   // show/hide the rotating sweep line
 // Hand the sweep to a per-pixel compositor (device: display.cpp). config gets the theme's
